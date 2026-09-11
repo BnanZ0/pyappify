@@ -22,6 +22,11 @@ interface ConsolePageProps {
     progress?: VersionChangeProgress;
     progressAction?: string;
     inline?: boolean;
+    hideLogs?: boolean;
+    progressIndeterminate?: boolean;
+    progressPhaseLabel?: string;
+    progressDetail?: string;
+    statusMessage?: string;
 }
 
 const renderMessageWithClickableLinks = (message: string) => {
@@ -64,6 +69,11 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                                                      progress,
                                                      progressAction,
                                                      inline = false,
+                                                     hideLogs = false,
+                                                     progressIndeterminate = false,
+                                                     progressPhaseLabel,
+                                                     progressDetail,
+                                                     statusMessage,
                                                  }) => {
     const {t} = useTranslation();
     const consoleBodyRef = useRef<null | HTMLDivElement>(null);
@@ -103,16 +113,16 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
             display: 'flex',
             flexDirection: 'column',
             height: inline ? 'auto' : 'calc(100vh - 48px)',
-            flex: inline ? '1 1 auto' : undefined,
-            minHeight: inline ? 0 : undefined,
-            overflow: inline ? 'hidden' : 'visible',
+            flex: inline && !hideLogs ? '1 1 auto' : undefined,
+            minHeight: inline && !hideLogs ? 0 : undefined,
+            overflow: inline && !hideLogs ? 'hidden' : 'visible',
         }}>
             <Box sx={{mb: 2}}>
                 <Typography variant="h5" component="h2" gutterBottom>
                     {title}
                 </Typography>
                 <Alert severity={alertSeverity} icon={internalIsProcessing ? <CircularProgress size={20}/> : undefined}>
-                    {displayMessage}
+                    {statusMessage ?? displayMessage}
                 </Alert>
                 {progress && (
                     <Box sx={{mt: 1.5}}>
@@ -125,16 +135,20 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                             </Typography>
                         </Box>
                         <LinearProgress
-                            variant="determinate"
+                            variant={progressIndeterminate ? 'indeterminate' : 'determinate'}
                             value={progress.value}
                             color={progress.phase === 'failed' ? 'error' : progress.phase === 'complete' ? 'success' : 'primary'}
                             sx={{height: 9, borderRadius: 999}}
                         />
                         <Box sx={{display: 'flex', justifyContent: 'space-between', gap: 2, mt: 0.75}}>
                             <Typography variant="caption" color="text.secondary">
-                                {progressPhaseLabels[progress.phase]}
+                                {progressPhaseLabel ?? progressPhaseLabels[progress.phase]}
                             </Typography>
-                            {progress.requirementsValue !== null && (
+                            {progressDetail ? (
+                                <Typography variant="caption" color="text.secondary">
+                                    {progressDetail}
+                                </Typography>
+                            ) : progress.requirementsValue !== null && (
                                 <Typography variant="caption" color="text.secondary">
                                     {t('Requirements progress: {{progress}}% (50% of total)', {
                                         progress: progress.requirementsValue,
@@ -146,7 +160,7 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                 )}
             </Box>
 
-            <Paper
+            {!hideLogs && <Paper
                 elevation={3}
                 sx={{
                     flex: '1 1 auto',
@@ -198,7 +212,7 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                 ))}
                 {logs.length === 0 && !internalIsProcessing &&
                     <Typography>{t('No logs received yet for {{appName}}.', {appName})}</Typography>}
-            </Paper>
+            </Paper>}
 
             <Box sx={{pt: 2, display: 'flex', justifyContent: 'flex-end'}}>
                 <Button variant="contained" onClick={onBack}>

@@ -71,6 +71,8 @@ Var FirstNonCDrive
 Var InvalidDir_ProgramFiles_Msg
 Var InvalidDir_NonASCII_Msg
 Var SetupMutexHandle
+Var UpdateHelperPid
+Var RequestedInstallDir
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -457,6 +459,9 @@ FunctionEnd
 {{/each}}
 
 Function .onInit
+  ${If} $INSTDIR != "${PLACEHOLDER_INSTALL_DIR}"
+    StrCpy $RequestedInstallDir $INSTDIR
+  ${EndIf}
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -474,8 +479,19 @@ Function .onInit
 
   Call EnsureSingleSetupInstance
 
+  ${GetOptions} $CMDLINE "/UPDATERPID=" $UpdateHelperPid
+
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
-    !insertmacro MUI_LANGDLL_DISPLAY
+    ${If} $PassiveMode = 1
+      System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'
+      StrCpy $LANGUAGE $0
+      ReadRegStr $0 HKCU "${MANUPRODUCTKEY}" "Installer Language"
+      ${If} $0 != ""
+        StrCpy $LANGUAGE $0
+      ${EndIf}
+    ${Else}
+      !insertmacro MUI_LANGDLL_DISPLAY
+    ${EndIf}
   !endif
 
   !insertmacro SetContext
@@ -510,6 +526,9 @@ Function .onInit
   !if "${INSTALLMODE}" == "both"
     !insertmacro MULTIUSER_INIT
   !endif
+  ${If} $RequestedInstallDir != ""
+    StrCpy $INSTDIR $RequestedInstallDir
+  ${EndIf}
 FunctionEnd
 
 
@@ -1076,6 +1095,10 @@ Function KillInstallDirExecutables
 FunctionEnd
 
 Function RestorePreviousInstallLocation
+  ${If} $RequestedInstallDir != ""
+    StrCpy $INSTDIR $RequestedInstallDir
+    Return
+  ${EndIf}
   ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
   StrCmp $4 "" +2 0
     StrCpy $INSTDIR $4

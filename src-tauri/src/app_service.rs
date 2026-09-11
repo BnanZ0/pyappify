@@ -5,6 +5,8 @@ use crate::app::{
 };
 use crate::emitter::get_app_handle;
 use crate::git::ensure_repository;
+use crate::installer_update;
+use crate::mirrorchyan::{self, UpdateSource};
 use crate::runas;
 use crate::utils::error::Error;
 use crate::utils::file;
@@ -266,6 +268,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
             let current_profile = app_from_disk.current_profile.clone();
             app_from_disk.icon = app_template.icon.clone();
             app_from_disk.profiles = app_template.profiles.clone();
+            app_from_disk.mirrorchyan = app_template.mirrorchyan.clone();
             app_from_disk.current_profile = current_profile;
             app_from_disk
         }
@@ -292,7 +295,10 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         Err(e) => return Err(e),
     };
 
-    if app.installed && !check_python_env_exists(app_name) {
+    installer_update::consume_result(&mut app)?;
+    recover_interrupted_installer_state(&mut app);
+    if app.update_source == UpdateSource::Git && app.installed && !check_python_env_exists(app_name)
+    {
         warn!(
             "Python venv for app '{}' is missing. Deleting app artifacts and marking as not installed.",
             app_name
@@ -313,7 +319,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         app.name
     );
     let repo_path = path::get_app_repo_path(&app.name);
-    if app.installed && !repo_path.exists() {
+    if app.update_source == UpdateSource::Git && app.installed && !repo_path.exists() {
         warn!(
             "Repository for app '{}' is missing. Marking as not installed.",
             app_name
@@ -321,13 +327,33 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         app.installed = false;
     }
 
-    if app.installed {
+    if app.installed && app.update_source == UpdateSource::Git {
         rollback_interrupted_pip_sync_on_startup(&mut app, &repo_path).await?;
     }
 
     load_app_details(&mut app).await?;
     save_app_config_to_json(&app).await?;
+    installer_update::acknowledge_result();
     Ok(app)
+}
+
+fn recover_interrupted_installer_state(app: &mut App) {
+    if app.update_source != UpdateSource::Mirrorchyan
+        || app.update_state != AppUpdateState::Updating
+    {
+        return;
+    }
+    if app.update_phase.as_deref() == Some("installing") {
+        app.update_state = AppUpdateState::Failed;
+        app.update_phase = Some("install_failed".into());
+        app.update_error = Some(
+            "The installation result is missing. Retry the complete installer to repair.".into(),
+        );
+    } else {
+        app.update_state = AppUpdateState::Idle;
+        app.update_phase = None;
+        app.update_error = Some("The previous download was interrupted. Retry the update.".into());
+    }
 }
 
 fn is_invalid_json_error(error: &anyhow::Error) -> bool {
@@ -394,6 +420,16 @@ pub async fn load_app() -> Result<App, Error> {
     }
 
     let mut auto_start_guard = AUTO_START_CHECKED.lock().await;
+    if get_app()
+        .await
+        .is_some_and(|a| a.update_source == UpdateSource::Mirrorchyan)
+    {
+        if !*auto_start_guard {
+            *auto_start_guard = true;
+            tokio::spawn(mirror_startup());
+        }
+        return get_app().await.ok_or_else(|| err!("App is not loaded."));
+    }
     if !*auto_start_guard {
         *auto_start_guard = true;
 
@@ -598,6 +634,50 @@ pub async fn load_app() -> Result<App, Error> {
 
 async fn update_app_from_disk() -> Result<bool, Error> {
     let mut app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        if app.update_state == AppUpdateState::Updating {
+            return Ok(false);
+        }
+        match mirrorchyan::latest(&app).await {
+            Ok(release) => {
+                app.available_versions = if app.update_state == AppUpdateState::Failed
+                    || mirrorchyan::newer(&release, app.current_version.as_deref())
+                {
+                    vec![release.version_name]
+                } else {
+                    vec![]
+                };
+                app.update_note = if release.release_note.is_empty() {
+                    vec![]
+                } else {
+                    vec![release.release_note]
+                };
+                if app.update_state == AppUpdateState::Idle
+                    && !installer_update::SKIP_AUTO_UPDATE.load(AtomicOrdering::SeqCst)
+                {
+                    app.update_error = None;
+                }
+            }
+            Err(error) => {
+                app.available_versions.clear();
+                app.update_error = Some(error.to_string());
+            }
+        }
+        // Do not overwrite a concurrent installation or a source switch.
+        let mut guard = APP.lock().await;
+        if let Some(current) = guard.as_mut().filter(|a| {
+            a.update_source == UpdateSource::Mirrorchyan
+                && a.update_state != AppUpdateState::Updating
+                && a.update_method == app.update_method
+                && a.mirrorchyan == app.mirrorchyan
+        }) {
+            current.available_versions = app.available_versions;
+            current.update_note = app.update_note;
+            current.update_error = app.update_error;
+            save_app_config_to_json(current).await?;
+        }
+        return Ok(true);
+    }
     let original_app = app.clone();
 
     info!(
@@ -662,10 +742,43 @@ pub async fn update_app_preferences(
     app_name: String,
     update_method: Option<String>,
     auto_start: Option<bool>,
+    update_source: Option<UpdateSource>,
 ) -> Result<(), Error> {
     let app_dir_lock = get_app_lock(&app_name).await?;
     let _guard = app_dir_lock.lock().await;
     let mut app = get_app_by_name(&app_name).await?;
+    if let Some(source) = update_source {
+        if app.update_state == AppUpdateState::Updating {
+            return Err(err!("Wait for the current update to finish"));
+        }
+        if source == UpdateSource::Mirrorchyan && app.mirrorchyan.is_none() {
+            return Err(err!("MirrorChyan is not configured for this application"));
+        }
+        if source != app.update_source {
+            if source == UpdateSource::Git && app.installed {
+                // Git-installed applications already have this repository. A
+                // complete installer does not, so restore that original Git
+                // invariant before committing the source switch.
+                ensure_repository(&app).await?;
+                let repo_path = path::get_app_repo_path(&app.name);
+                let previous_known_version = app.current_version.clone();
+                let (versions, current) =
+                    git::get_tags_and_current_version(&app.name, repo_path).await?;
+                let (current_version, current_version_missing) =
+                    resolve_current_version_state(previous_known_version, &versions, current);
+                app.available_versions = versions;
+                app.current_version = current_version;
+                app.current_version_missing = current_version_missing;
+            } else {
+                app.available_versions.clear();
+            }
+            app.update_source = source;
+            app.update_state = AppUpdateState::Idle;
+            app.update_target_version = None;
+            app.update_error = None;
+            app.update_phase = None;
+        }
+    }
 
     if let Some(update_method) = update_method {
         if !matches!(
@@ -678,6 +791,11 @@ pub async fn update_app_preferences(
         }
         STARTUP_OVERRIDES.lock().await.update_method = None;
         app.update_method = update_method;
+        if app.update_method == UPDATE_METHOD_OPTION_MANUAL
+            && app.update_phase.as_deref() == Some("waiting")
+        {
+            app.update_phase = None;
+        }
     }
 
     if let Some(auto_start) = auto_start {
@@ -705,6 +823,13 @@ pub async fn get_update_notes(app_name: String, version: String) -> Result<Vec<S
     let app_lock = get_app_lock(&app_name).await?;
     let _guard = app_lock.lock().await;
     let app = get_app_by_name(&app_name).await?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        let release = mirrorchyan::latest(&app).await?;
+        if release.version_name != version {
+            return Err(err!("Only the latest MirrorChyan release is available"));
+        }
+        return Ok(vec![release.release_note]);
+    }
     let messages =
         git::get_commit_messages_for_version_diff(&app.get_repo_path(), &version).await?;
     info!(
@@ -719,6 +844,11 @@ pub async fn get_version_list(
     release_only: bool,
 ) -> Result<Vec<git::VersionHistoryEntry>, Error> {
     let app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        return Err(err!(
+            "Git version history is unavailable while MirrorChyan is selected"
+        ));
+    }
     let app_lock = get_app_lock(&app.name).await?;
     let _guard = app_lock.lock().await;
     ensure_repository(&app).await?;
@@ -932,6 +1062,21 @@ pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> 
     let repo_path = path::get_app_repo_path(app_name);
     let app = get_app_by_name(app_name).await?;
 
+    if app.update_source == UpdateSource::Mirrorchyan {
+        if get_app_handle().is_none() {
+            return Err(err!("CLI setup requires the Git update source"));
+        }
+        if profile_name != app.current_profile {
+            return Err(err!(
+                "Use the matching complete setup or switch to Git to install another profile"
+            ));
+        }
+        let release = mirrorchyan::latest(&app).await?;
+        return update_with_installer(app_name, &release.version_name, false)
+            .await
+            .map(|_| ());
+    }
+
     ensure_repository(&app).await?;
 
     let working_dir_path = get_app_working_dir_path(app_name);
@@ -1092,7 +1237,15 @@ async fn rollback_to_previous_version(
 pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Error> {
     info!("Updating {} to version {}", app_name, version);
     let app_dir_lock = get_app_lock(app_name).await?;
-    let _lock_guard = app_dir_lock.lock().await;
+    let _lock_guard = app_dir_lock
+        .try_lock()
+        .map_err(|_| err!("Another application operation is in progress"))?;
+
+    if get_app_by_name(app_name).await?.update_source == UpdateSource::Mirrorchyan {
+        return update_with_installer(app_name, version, false)
+            .await
+            .map(|_| ());
+    }
 
     ensure_app_stopped_for_update(app_name).await?;
 
@@ -1181,6 +1334,208 @@ pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Erro
     }
 }
 
+async fn set_installer_phase(app_name: &str, phase: &str) -> Result<()> {
+    let mut guard = APP.lock().await;
+    let app = guard
+        .as_mut()
+        .filter(|a| a.name == app_name)
+        .context("Application not loaded")?;
+    app.update_phase = Some(phase.into());
+    save_app_config_to_json(app).await?;
+    drop(guard);
+    mirrorchyan::progress(app_name, phase, 0, None);
+    emit_app().await;
+    Ok(())
+}
+
+/// Caller owns APP_DIR_LOCK throughout download and handoff. Stop the Python
+/// processes directly here rather than recursively acquiring that lock.
+#[derive(PartialEq)]
+enum InstallerOutcome {
+    HandedOff,
+    Deferred,
+}
+
+async fn update_with_installer(
+    app_name: &str,
+    version: &str,
+    automatic: bool,
+) -> Result<InstallerOutcome, Error> {
+    let app = get_app_by_name(app_name).await?;
+    if app.update_state == AppUpdateState::Updating {
+        return Err(err!("An update is already in progress"));
+    }
+    if app.update_source != UpdateSource::Mirrorchyan {
+        return Err(err!("The update source changed; check for updates again"));
+    }
+    let previously_failed = app.update_state == AppUpdateState::Failed;
+    let dir = installer_update::new_task_dir()?;
+    persist_update_state(
+        app_name,
+        AppUpdateState::Updating,
+        Some(version.into()),
+        None,
+    )
+    .await?;
+    let result: Result<InstallerOutcome> = async {
+        set_installer_phase(app_name, "downloading").await?;
+        let mut request_app = get_app().await.context("Application not loaded")?;
+        if previously_failed || request_app.current_version.as_deref() == Some(version) {
+            request_app.current_version = None;
+        }
+        mirrorchyan::download(&request_app, version, &dir).await?;
+        if automatic && ensure_app_stopped_for_update(app_name).await.is_err() {
+            return Ok(InstallerOutcome::Deferred);
+        }
+        if automatic
+            && get_app()
+                .await
+                .is_some_and(|a| a.effective_update_method() == UPDATE_METHOD_OPTION_MANUAL)
+        {
+            return Ok(InstallerOutcome::Deferred);
+        }
+        let handoff_app = get_app_by_name(app_name).await?;
+        installer_update::prepare(&handoff_app, version, &dir).await?;
+        set_installer_phase(app_name, "stopping").await?;
+        if automatic {
+            if ensure_app_stopped_for_update(app_name).await.is_err() {
+                return Ok(InstallerOutcome::Deferred);
+            }
+        } else {
+            kill_app_processes(app_name).await?;
+        }
+        for _ in 0..50 {
+            if ensure_app_stopped_for_update(app_name).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ensure_app_stopped_for_update(app_name).await?;
+        set_installer_phase(app_name, "installing").await?;
+        let handle = get_app_handle()
+            .context("The installer update must be started from the launcher window")?;
+        installer_update::commit(&dir)?;
+        handle.exit(0);
+        Ok(InstallerOutcome::HandedOff)
+    }
+    .await;
+    if matches!(result, Ok(InstallerOutcome::Deferred)) {
+        installer_update::cancel(&dir);
+        persist_update_state(app_name, AppUpdateState::Idle, Some(version.into()), None).await?;
+        set_installer_phase(app_name, "waiting").await?;
+        return Ok(InstallerOutcome::Deferred);
+    }
+    if let Err(error) = result {
+        installer_update::cancel(&dir);
+        persist_update_state(
+            app_name,
+            if previously_failed {
+                AppUpdateState::Failed
+            } else {
+                AppUpdateState::Idle
+            },
+            Some(version.into()),
+            Some(error.to_string()),
+        )
+        .await?;
+        set_installer_phase(
+            app_name,
+            if previously_failed {
+                "install_failed"
+            } else {
+                "download_failed"
+            },
+        )
+        .await?;
+        emit_error!(app_name, "{}", error);
+        emit_error_finish!(app_name);
+        return Err(error.into());
+    }
+    Ok(InstallerOutcome::HandedOff)
+}
+
+async fn mirror_startup() {
+    loop {
+        let Some(app) = get_app().await else {
+            return;
+        };
+        if app.update_source != UpdateSource::Mirrorchyan {
+            return;
+        }
+        if app.effective_update_method() == UPDATE_METHOD_OPTION_MANUAL
+            || installer_update::SKIP_AUTO_UPDATE.load(AtomicOrdering::SeqCst)
+            || app.update_state != AppUpdateState::Idle
+            || app.available_versions.is_empty()
+        {
+            break;
+        }
+        // Waiting never owns APP_DIR_LOCK, including when the window is in the tray.
+        if ensure_app_stopped_for_update(&app.name).await.is_err() {
+            if app.update_phase.as_deref() != Some("waiting") {
+                let _ = set_installer_phase(&app.name, "waiting").await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        let release = match mirrorchyan::latest(&app).await {
+            Ok(release) if mirrorchyan::newer(&release, app.current_version.as_deref()) => release,
+            _ => break,
+        };
+        let lock = match get_app_lock(&app.name).await {
+            Ok(lock) => lock,
+            Err(_) => return,
+        };
+        let Ok(_guard) = lock.try_lock() else {
+            return;
+        };
+        let Some(current) = get_app().await else {
+            return;
+        };
+        if current.update_source != UpdateSource::Mirrorchyan
+            || current.effective_update_method() == UPDATE_METHOD_OPTION_MANUAL
+        {
+            return;
+        }
+        match update_with_installer(&app.name, &release.version_name, true).await {
+            Ok(InstallerOutcome::Deferred) => continue,
+            Ok(InstallerOutcome::HandedOff) => return,
+            Err(error) => {
+                emit_error!(&app.name, "{}", error);
+                return;
+            }
+        }
+    }
+    let Some(app) = get_app().await else {
+        return;
+    };
+    if app.update_phase.as_deref() == Some("waiting") {
+        let mut guard = APP.lock().await;
+        if let Some(current) = guard.as_mut() {
+            current.update_phase = None;
+            let _ = save_app_config_to_json(current).await;
+        }
+        drop(guard);
+        emit_app().await;
+    }
+    if app.auto_start && app.installed && app.update_state == AppUpdateState::Idle {
+        AUTO_START_CANCELLED.store(false, AtomicOrdering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if AUTO_START_CANCELLED.load(AtomicOrdering::SeqCst) {
+            return;
+        }
+        if let Some(current) = get_app().await {
+            if current.auto_start
+                && current.update_state == AppUpdateState::Idle
+                && current.update_source == UpdateSource::Mirrorchyan
+                && ensure_app_stopped_for_update(&current.name).await.is_ok()
+            {
+                if let Some(handle) = get_app_handle() {
+                    let _ = start_app(handle.clone(), current.name).await;
+                }
+            }
+        }
+    }
+}
 async fn ensure_app_stopped_for_update(app_name: &str) -> Result<(), Error> {
     let app_base_path = get_app_base_path(app_name);
     let running_pids = task::spawn_blocking(move || {
@@ -1624,6 +1979,9 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
     ensure_app_is_ready_to_start(&app_name).await?;
 
     if !check_python_env_exists(&app_name) {
+        if get_app_by_name(&app_name).await?.update_source == UpdateSource::Mirrorchyan {
+            return Err(err!("The Python environment is missing. Run the complete setup to repair this installation."));
+        }
         warn!(
             "Python .venv not found for '{}'. Deleting app artifacts.",
             &app_name
@@ -1705,7 +2063,8 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
     );
 
     let marker_path = working_dir.join(python_env::PIP_UPDATE_NEEDED_MARKER);
-    if marker_path.exists() {
+    if marker_path.exists() && get_app_by_name(&app_name).await?.update_source == UpdateSource::Git
+    {
         info!(
             "Marker file found for app '{}' at {}. Attempting to re-install requirements.",
             app_name,
@@ -2057,6 +2416,23 @@ pub async fn periodically_update_app_running_status(app_handle: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_install_receipt_is_not_treated_as_a_failed_download() {
+        let mut app: crate::app::App = serde_yaml::from_str("name: sample\nupdate_source: mirrorchyan\nupdate_state: updating\nupdate_phase: installing\n").unwrap();
+        super::recover_interrupted_installer_state(&mut app);
+        assert_eq!(app.update_state, crate::app::AppUpdateState::Failed);
+        assert_eq!(app.update_phase.as_deref(), Some("install_failed"));
+    }
+
+    #[test]
+    fn interrupted_download_leaves_installed_app_available() {
+        let mut app: crate::app::App = serde_yaml::from_str("name: sample\ninstalled: true\ncurrent_version: v1.0.0\nupdate_source: mirrorchyan\nupdate_state: updating\nupdate_phase: downloading\n").unwrap();
+        super::recover_interrupted_installer_state(&mut app);
+        assert_eq!(app.update_state, crate::app::AppUpdateState::Idle);
+        assert_eq!(app.current_version.as_deref(), Some("v1.0.0"));
+        assert!(app.installed);
+    }
+
     use super::{
         backup_invalid_app_config, build_app_shortcut_bootstrap,
         build_python_execution_environment, get_update_target, icon_mime_type,

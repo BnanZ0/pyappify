@@ -2,10 +2,19 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
+import {
+    mirrorChinese,
+    mirrorEnglish,
+    mirrorJapanese,
+    mirrorKorean,
+    mirrorSpanish,
+    mirrorTraditional,
+} from './mirrorTranslations';
 
 const resources = {
     en: {
         translation: {
+            ...mirrorEnglish,
             "appMadeWith": "App made with {{name}}",
             "appLauncherName": "{{appName}} Launcher",
             "Installed": "Installed",
@@ -41,7 +50,7 @@ const resources = {
             "Starting...": "Starting...",
             "Install": "Install",
             "Deleting...": "Deleting...",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "Are you sure you want to delete {{appName}}? This action cannot be undone.",
+            "Are you sure you want to delete {{appName}}?": "Are you sure you want to delete {{appName}}?",
             "Change Profile": "Change Profile",
             "Changing...": "Changing...",
             "Change version...": "Change version...",
@@ -128,6 +137,7 @@ const resources = {
     },
     'zh-CN': {
         translation: {
+            ...mirrorChinese,
             "Confirm Deletion": "确认删除",
             "appMadeWith": "使用 {{name}} 打包",
             "appLauncherName": "{{appName}} 启动器",
@@ -162,7 +172,7 @@ const resources = {
             "Install": "安装",
             "Installing...": "正在安装...",
             "Delete": "删除",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "您确定要删除 {{appName}} 吗？此操作无法撤销。",
+            "Are you sure you want to delete {{appName}}?": "您确定要删除 {{appName}} 吗?",
             "Deleting...": "正在删除...",
             "Change Profile": "切换配置",
             "Changing...": "正在切换...",
@@ -252,6 +262,7 @@ const resources = {
     },
     'zh-TW': {
         translation: {
+            ...mirrorTraditional,
             "Confirm Deletion": "確認刪除",
             "appMadeWith": "使用 {{name}} 打包",
             "appLauncherName": "{{appName}} 啟動器",
@@ -284,7 +295,7 @@ const resources = {
             "Install": "安裝",
             "Installing...": "正在安裝...",
             "Delete": "刪除",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "您確定要刪除 {{appName}} 嗎？此操作無法復原。",
+            "Are you sure you want to delete {{appName}}?": "您確定要刪除 {{appName}} 嗎?",
             "Deleting...": "正在刪除...",
             "Change Profile": "切換設定檔",
             "Changing...": "正在切換...",
@@ -374,6 +385,7 @@ const resources = {
     },
     ja: {
         translation: {
+            ...mirrorJapanese,
             "Confirm Deletion": "削除の確認",
             "appMadeWith": "{{name}} で作られたアプリ",
             "appLauncherName": "{{appName}} ランチャー",
@@ -406,7 +418,7 @@ const resources = {
             "Install": "インストール",
             "Installing...": "インストール中...",
             "Delete": "削除",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "{{appName}} を削除してもよろしいですか？この操作は元に戻せません。",
+            "Are you sure you want to delete {{appName}}?": "{{appName}} を削除してもよろしいですか?",
             "Deleting...": "削除中...",
             "Change Profile": "プロファイルを変更",
             "Changing...": "変更中...",
@@ -496,6 +508,7 @@ const resources = {
     },
     ko: {
         translation: {
+            ...mirrorKorean,
             "Confirm Deletion": "삭제 확인",
             "appMadeWith": "{{name}}(으)로 만든 앱",
             "appLauncherName": "{{appName}} 런처",
@@ -528,7 +541,7 @@ const resources = {
             "Install": "설치",
             "Installing...": "설치 중...",
             "Delete": "삭제",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "{{appName}}을(를) 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
+            "Are you sure you want to delete {{appName}}?": "{{appName}}을(를) 삭제하시겠습니까?",
             "Deleting...": "삭제 중...",
             "Change Profile": "프로필 변경",
             "Changing...": "변경 중...",
@@ -618,6 +631,7 @@ const resources = {
     },
     es: {
         translation: {
+            ...mirrorSpanish,
             "Confirm Deletion": "Confirmar Eliminación",
             "appMadeWith": "Aplicación hecha con {{name}}",
             "appLauncherName": "Lanzador de {{appName}}",
@@ -650,7 +664,7 @@ const resources = {
             "Install": "Instalar",
             "Installing...": "Instalando...",
             "Delete": "Eliminar",
-            "Are you sure you want to delete {{appName}}? This action cannot be undone.": "¿Está seguro de que desea eliminar {{appName}}? Esta acción no se puede deshacer.",
+            "Are you sure you want to delete {{appName}}?": "¿Está seguro de que desea eliminar {{appName}}?",
             "Deleting...": "Eliminando...",
             "Change Profile": "Cambiar Perfil",
             "Changing...": "Cambiando...",

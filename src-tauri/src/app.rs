@@ -36,6 +36,12 @@ pub enum AppUpdateState {
 pub struct App {
     pub name: String,
     #[serde(default)]
+    pub mirrorchyan: Option<crate::mirrorchyan::MirrorConfig>,
+    #[serde(default)]
+    pub update_source: crate::mirrorchyan::UpdateSource,
+    #[serde(default)]
+    pub update_phase: Option<String>,
+    #[serde(default)]
     pub icon: String,
     #[serde(default)]
     pub website: Option<String>,
@@ -245,9 +251,11 @@ pub fn update_app_from_yml(app: &mut App, file_path_str: &str) {
     };
 
     apply_profile_inheritance(&mut parsed_app);
-
     app.icon = parsed_app.icon;
     app.website = parsed_app.website;
+    if parsed_app.mirrorchyan.is_some() {
+        app.mirrorchyan = parsed_app.mirrorchyan;
+    }
     app.profiles = parsed_app.profiles;
 
     if app.get_profile(&app.current_profile).is_none() {
@@ -483,11 +491,13 @@ mod tests {
         let without_website: App = serde_yaml::from_str("name: example\n").unwrap();
         assert_eq!(without_website.website, None);
 
-        let with_website: App = serde_yaml::from_str(
-            "name: example\nwebsite: https://example.com/downloads\n",
-        )
-        .unwrap();
-        assert_eq!(with_website.website.as_deref(), Some("https://example.com/downloads"));
+        let with_website: App =
+            serde_yaml::from_str("name: example\nwebsite: https://example.com/downloads\n")
+                .unwrap();
+        assert_eq!(
+            with_website.website.as_deref(),
+            Some("https://example.com/downloads")
+        );
     }
 
     #[test]

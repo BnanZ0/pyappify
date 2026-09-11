@@ -42,6 +42,28 @@ profiles:
 `pip_args: "--no-deps"` when packages listed in the requirements file should be
 installed without their dependencies.
 
+### Optional MirrorChyan installer updates
+
+Add an application-level resource configuration to enable an **Update source**
+selector in Settings (existing installations still default to Git + pip):
+
+```yaml
+mirrorchyan:
+  resource_id: "YOUR_RESOURCE_ID"
+  stable_channel: "stable"
+  # prerelease_channel: "beta"  # Only set when this resource provides that channel.
+```
+
+The resource must download your complete **NSIS setup.exe**, including the Python
+application, its environment, and this launcher. Users select MirrorChyan and save
+their CDK in Settings. Updates download inside the launcher, show the installer's
+progress window, replace the existing installation, and reopen the launcher
+automatically. Windows may still request administrator approval.
+
+No ZIP package, Git checkout, or pip installation is involved in this update
+path. The existing setup's file-copy rules remain unchanged. See
+[MirrorChyan configuration, recovery, and validation](docs/mirrorchyan.md).
+
 3. You can test the launcher by double-clicking the pyappify.exe and install python with the GUI. You can then package the files for offline or online distribution.
 
 * pyappify.yml (Required, You project config.)

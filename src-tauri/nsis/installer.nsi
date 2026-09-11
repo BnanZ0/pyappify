@@ -21,6 +21,7 @@ ManifestDPIAwareness PerMonitorV2
 !include "FileAssociation.nsh"
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
+!include "Win\RestartManager.nsh"
 !include "StrFunc.nsh"
 ${StrCase}
 ${StrLoc}
@@ -73,6 +74,9 @@ Var InvalidDir_NonASCII_Msg
 Var SetupMutexHandle
 Var UpdateHelperPid
 Var RequestedInstallDir
+Var RestartManagerSession
+Var RestartManagerError
+Var RestartManagerFileCount
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -1030,65 +1034,79 @@ Function EnsureSingleSetupInstance
   ${EndIf}
 FunctionEnd
 
+Function ProbeRestartManagerFile
+  ${If} $R9 == $EXEPATH
+    Push ""
+    Return
+  ${EndIf}
+  !insertmacro RestartManager_RegisterFile $RestartManagerSession "$R9"
+  ${If} $0 != 0
+    StrCpy $RestartManagerError $0
+    Push "StopLocate"
+    Return
+  ${EndIf}
+  IntOp $RestartManagerFileCount $RestartManagerFileCount + 1
+  Push ""
+FunctionEnd
+
+Function CloseInstallDirExecutablesWithRestartManager
+  StrCpy $RestartManagerSession ""
+  StrCpy $RestartManagerError 0
+  StrCpy $RestartManagerFileCount 0
+  !insertmacro RestartManager_StartSession $RestartManagerSession
+  ${If} $RestartManagerSession == ""
+    StrCpy $RestartManagerError 1
+    Return
+  ${EndIf}
+
+  ${Locate} "$INSTDIR" "/L=F /M=*.exe /G=1" "ProbeRestartManagerFile"
+  ${If} $RestartManagerError = 0
+    ${Locate} "$INSTDIR" "/L=F /M=*.dll /G=1" "ProbeRestartManagerFile"
+  ${EndIf}
+  ${If} $RestartManagerError = 0
+    ${Locate} "$INSTDIR" "/L=F /M=*.pyd /G=1" "ProbeRestartManagerFile"
+  ${EndIf}
+
+  ${If} $RestartManagerError = 0
+    ; With a null output array, ERROR_MORE_DATA (234) means $R1 contains the
+    ; number of affected processes. Zero means there are no current lockers.
+    StrCpy $R1 0
+    StrCpy $R2 0
+    StrCpy $R3 0
+    System::Call 'RSTRTMGR::RmGetList(i $RestartManagerSession, *i .r1, *i .r2, p 0, *i .r3) i .r0'
+    ${If} $0 = 0
+    ${OrIf} $0 = 234
+      DetailPrint "Restart Manager: registered $RestartManagerFileCount files; detected $R1 affected processes; reboot reasons $R3."
+      ${If} $R3 != 0
+        StrCpy $RestartManagerError 3010 ; ERROR_SUCCESS_REBOOT_REQUIRED
+      ${ElseIf} $R1 > 0
+        ; Ask applications to close normally first, then force only those that
+        ; do not respond. Both calls use the resource list managed by Windows.
+        System::Call 'RSTRTMGR::RmShutdown(i $RestartManagerSession, i 0, p 0) i .r0'
+        ${If} $0 != 0
+          System::Call 'RSTRTMGR::RmShutdown(i $RestartManagerSession, i ${RmForceShutdown}, p 0) i .r0'
+        ${EndIf}
+        StrCpy $RestartManagerError $0
+      ${EndIf}
+    ${Else}
+      StrCpy $RestartManagerError $0
+    ${EndIf}
+  ${EndIf}
+  !insertmacro RestartManager_EndSession $RestartManagerSession
+FunctionEnd
+
 Function KillInstallDirExecutables
   ${IfNot} ${FileExists} "$INSTDIR\*.*"
     Return
   ${EndIf}
 
-  InitPluginsDir
-  StrCpy $R0 "$PLUGINSDIR\kill-install-dir-executables.ps1"
-  FileOpen $R1 "$R0" w
-  FileWrite $R1 "param($\r$\n"
-  FileWrite $R1 "  [string]$$InstallDir,$\r$\n"
-  FileWrite $R1 "  [string]$$InstallerPath$\r$\n"
-  FileWrite $R1 ")$\r$\n"
-  FileWrite $R1 "$$ErrorActionPreference = 'SilentlyContinue'$\r$\n"
-  FileWrite $R1 "if (-not $$InstallDir) { exit 0 }$\r$\n"
-  FileWrite $R1 "$$installRoot = [System.IO.Path]::GetFullPath($$InstallDir).TrimEnd('\')$\r$\n"
-  FileWrite $R1 "$$currentInstaller = ''$\r$\n"
-  FileWrite $R1 "if ($$InstallerPath) { $$currentInstaller = [System.IO.Path]::GetFullPath($$InstallerPath) }$\r$\n"
-  FileWrite $R1 "function Get-InstallDirProcesses {$\r$\n"
-  FileWrite $R1 "  $$processes = Get-CimInstance Win32_Process$\r$\n"
-  FileWrite $R1 "  if (-not $$processes) { $$processes = Get-WmiObject Win32_Process }$\r$\n"
-  FileWrite $R1 "  foreach ($$process in $$processes) {$\r$\n"
-  FileWrite $R1 "    if ($$process.ProcessId -eq $$PID) { continue }$\r$\n"
-  FileWrite $R1 "    $$exePath = $$process.ExecutablePath$\r$\n"
-  FileWrite $R1 "    if ($$exePath) {$\r$\n"
-  FileWrite $R1 "      $$fullPath = [System.IO.Path]::GetFullPath($$exePath)$\r$\n"
-  FileWrite $R1 "      if ($$currentInstaller -and [string]::Equals($$fullPath, $$currentInstaller, [System.StringComparison]::OrdinalIgnoreCase)) { continue }$\r$\n"
-  FileWrite $R1 "      if ($$fullPath.StartsWith($$installRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $$process; continue }$\r$\n"
-  FileWrite $R1 "    }$\r$\n"
-  FileWrite $R1 "    $$commandLine = $$process.CommandLine$\r$\n"
-  FileWrite $R1 "    if ($$commandLine -and $$commandLine.IndexOf($$installRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $$process; continue }$\r$\n"
-  FileWrite $R1 "    try {$\r$\n"
-  FileWrite $R1 "      $$nativeProcess = Get-Process -Id $$process.ProcessId -ErrorAction SilentlyContinue$\r$\n"
-  FileWrite $R1 "      foreach ($$module in $$nativeProcess.Modules) {$\r$\n"
-  FileWrite $R1 "        $$modulePath = $$module.FileName$\r$\n"
-  FileWrite $R1 "        if ($$modulePath -and $$modulePath.StartsWith($$installRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $$process; break }$\r$\n"
-  FileWrite $R1 "      }$\r$\n"
-  FileWrite $R1 "    } catch {}$\r$\n"
-  FileWrite $R1 "  }$\r$\n"
-  FileWrite $R1 "}$\r$\n"
-  FileWrite $R1 "$$targets = @(Get-InstallDirProcesses | Sort-Object ProcessId -Unique)$\r$\n"
-  FileWrite $R1 "foreach ($$process in $$targets) {$\r$\n"
-  FileWrite $R1 "  Stop-Process -Id $$process.ProcessId -Force$\r$\n"
-  FileWrite $R1 "  taskkill.exe /F /T /PID $$process.ProcessId | Out-Null$\r$\n"
-  FileWrite $R1 "}$\r$\n"
-  FileWrite $R1 "foreach ($$process in $$targets) { Wait-Process -Id $$process.ProcessId -Timeout 5 }$\r$\n"
-  FileWrite $R1 "Start-Sleep -Milliseconds 500$\r$\n"
-  FileWrite $R1 "$$remaining = @(Get-InstallDirProcesses)$\r$\n"
-  FileWrite $R1 "if ($$remaining.Count -gt 0) { exit 2 }$\r$\n"
-  FileWrite $R1 "exit 0$\r$\n"
-  FileClose $R1
-
   retry_kill_install_dir_executables:
-  DetailPrint "Stopping running executables in $INSTDIR"
-  ExecWait 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$R0" "$INSTDIR" "$EXEPATH"' $R2
-  ${If} $R2 <> 0
+  Call CloseInstallDirExecutablesWithRestartManager
+  ${If} $RestartManagerError <> 0
     ${If} $LANGUAGE == 2052
-      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "无法停止正在使用 $INSTDIR 中 Python/Qt 文件的进程。$\r$\n请关闭相关应用后点击“重试”。" IDRETRY retry_kill_install_dir_executables
+      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Windows 无法停止正在使用 $INSTDIR 中安装文件的程序（错误 $RestartManagerError）。$\r$\n请关闭相关应用后点击“重试”。" IDRETRY retry_kill_install_dir_executables
     ${Else}
-      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Some processes are still using Python/Qt files in $INSTDIR.$\r$\nClose the related app and click Retry." IDRETRY retry_kill_install_dir_executables
+      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Windows could not stop programs using installation files in $INSTDIR (error $RestartManagerError).$\r$\nClose the related application and click Retry." IDRETRY retry_kill_install_dir_executables
     ${EndIf}
     Abort
   ${EndIf}

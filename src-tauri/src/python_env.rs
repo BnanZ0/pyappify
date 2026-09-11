@@ -7,7 +7,7 @@ use crate::utils::process::RemovePythonEnvsExt;
 use crate::{
     config_manager::GLOBAL_CONFIG_STATE, emit_info, emit_update_info, err, utils::command,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
 use rand::distr::Alphanumeric;
 use rand::RngExt;
@@ -23,6 +23,13 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 pub const PIP_UPDATE_NEEDED_MARKER: &str = ".pip_update_needed.tmp";
+
+fn ensure_operation_not_cancelled() -> Result<()> {
+    if crate::app_service::app_operation_cancelled() {
+        bail!("Operation cancelled by user");
+    }
+    Ok(())
+}
 
 const KNOWN_PATCHES: [(&str, &str, &str, &str); 7] = [
     ("3.13", "3.13.5", "https://www.python.org/ftp/python/3.13.5/python-3.13.5-amd64.zip", "https://mirrors.huaweicloud.com/python/3.13.5/python-3.13.5-amd64.zip"),
@@ -138,14 +145,18 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
     let download_result = match download_file(&primary_url, &archive_path, app_name).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            warn!(
-                "Download from primary URL {} failed: {:#}. Trying backup URL: {}",
-                primary_url, e, backup_url
-            );
-            if archive_path.exists() {
-                fs::remove_file(&archive_path).ok();
+            if crate::app_service::app_operation_cancelled() {
+                Err(e)
+            } else {
+                warn!(
+                    "Download from primary URL {} failed: {:#}. Trying backup URL: {}",
+                    primary_url, e, backup_url
+                );
+                if archive_path.exists() {
+                    fs::remove_file(&archive_path).ok();
+                }
+                download_file(&backup_url, &archive_path, app_name).await
             }
-            download_file(&backup_url, &archive_path, app_name).await
         }
     };
 
@@ -308,13 +319,31 @@ fn extract_zip(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to open zip archive: {}", archive_path.display()))?;
     let mut archive = ZipArchive::new(zip_file)
         .with_context(|| format!("Failed to read zip archive: {}", archive_path.display()))?;
-    archive.extract(extract_to_dir).with_context(|| {
-        format!(
-            "Failed to extract zip archive {} to {}",
-            archive_path.display(),
-            extract_to_dir.display()
-        )
-    })?;
+    for index in 0..archive.len() {
+        ensure_operation_not_cancelled()?;
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!(
+                "Failed to read entry {index} from {}",
+                archive_path.display()
+            )
+        })?;
+        let enclosed_name = entry
+            .enclosed_name()
+            .ok_or_else(|| anyhow!("Unsafe path in zip archive: {}", entry.name()))?;
+        let output_path = extract_to_dir.join(enclosed_name);
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path)?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::File::create(&output_path).with_context(|| {
+            format!("Failed to create extracted file {}", output_path.display())
+        })?;
+        io::copy(&mut entry, &mut output)
+            .with_context(|| format!("Failed to extract file {}", output_path.display()))?;
+    }
     Ok(())
 }
 
@@ -326,6 +355,7 @@ fn extract_tar_gz(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
     let mut archive = Archive::new(tar_stream);
 
     for entry_result in archive.entries()? {
+        ensure_operation_not_cancelled()?;
         let mut entry = entry_result.context("Failed to read entry from tar archive")?;
         let path_in_archive = entry.path()?.into_owned();
         let path_after_stripping_python_dir = match path_in_archive.strip_prefix("python") {
@@ -432,16 +462,24 @@ fn get_user_agent() -> String {
 }
 
 async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()> {
+    ensure_operation_not_cancelled()?;
     let mut client_builder = Client::builder();
     if url.starts_with("https://www.modelscope.cn") {
         client_builder = client_builder.user_agent(get_user_agent());
     }
     let client = client_builder.build()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to initiate download from {}", url))?;
+    let request = client.get(url).send();
+    tokio::pin!(request);
+    let response = loop {
+        tokio::select! {
+            result = &mut request => {
+                break result.with_context(|| format!("Failed to initiate download from {}", url))?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                ensure_operation_not_cancelled()?;
+            }
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -469,7 +507,15 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
     let mut last_reported_percent: i64 = -1;
 
     let mut stream = response.bytes_stream();
-    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+    loop {
+        ensure_operation_not_cancelled()?;
+        let item = tokio::select! {
+            item = futures_util::StreamExt::next(&mut stream) => item,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => continue,
+        };
+        let Some(item) = item else {
+            break;
+        };
         let chunk =
             item.with_context(|| format!("Failed to read chunk from download stream of {}", url))?;
         file.write_all(&chunk)

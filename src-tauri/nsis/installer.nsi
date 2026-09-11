@@ -1073,7 +1073,7 @@ Function CloseInstallDirExecutablesWithRestartManager
     StrCpy $R1 0
     StrCpy $R2 0
     StrCpy $R3 0
-    System::Call 'RSTRTMGR::RmGetList(i $RestartManagerSession, *i .r1, *i .r2, p 0, *i .r3) i .r0'
+    System::Call 'RSTRTMGR::RmGetList(i $RestartManagerSession, *i .R1, *i .R2, p 0, *i .R3) i .r0'
     ${If} $0 = 0
     ${OrIf} $0 = 234
       DetailPrint "Restart Manager: registered $RestartManagerFileCount files; detected $R1 affected processes; reboot reasons $R3."

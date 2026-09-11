@@ -710,6 +710,13 @@ async fn update_app_from_disk() -> Result<bool, Error> {
         }
         return Ok(true);
     }
+    // Git refreshes persist the entire snapshot. Keep process-only startup
+    // overrides from get_app() out of both app.json and the stored APP state.
+    let mut app = APP
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| err!("App is not loaded."))?;
     let original_app = app.clone();
 
     info!(

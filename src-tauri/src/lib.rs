@@ -16,9 +16,9 @@ use crate::app::{
     UPDATE_METHOD_OPTION_AUTO, UPDATE_METHOD_OPTION_AUTO_PRE_RELEASE, UPDATE_METHOD_OPTION_MANUAL,
 };
 use crate::app_service::{
-    delete_app, get_app_icon, get_update_notes, get_version_list, load_app, set_startup_overrides,
-    setup_app, start_app, stop_app, update_app_preferences, update_to_version, StartupOverrides,
-    AUTO_START_CHECKED,
+    cancel_app_operation, delete_app, get_app_icon, get_update_notes, get_version_list, load_app,
+    set_startup_overrides, setup_app, start_app, stop_app, update_app_preferences,
+    update_to_version, StartupOverrides, AUTO_START_CHECKED,
 };
 use crate::config_manager::{
     get_config_payload, init_config_manager, save_configuration, update_config_item,
@@ -697,6 +697,7 @@ pub async fn run() {
                 show_main_window,
                 start_app,
                 stop_app,
+                cancel_app_operation,
                 load_app,
                 get_app_icon,
                 setup_app,

@@ -684,6 +684,17 @@ function App() {
         setAppActionLoading(prev => ({...prev, [appName]: false}));
     };
 
+    const handleCancelAppOperation = async (appName: string) => {
+        try {
+            await invoke('cancel_app_operation', {appName});
+        } catch (rawError) {
+            const errorMessage = rawError instanceof Error ? rawError.message : String(rawError);
+            console.error(`Failed to cancel operation for ${appName}:`, rawError);
+            updateStatus({error: `Cancel operation for ${appName} failed: ${errorMessage}`});
+            throw rawError;
+        }
+    };
+
     const handleVersionSelected = (appName: string, targetVersion: string, currentAppVersion: string | null) => {
         if (!targetVersion) {
             // Version cleared — hide inline log
@@ -901,6 +912,7 @@ function App() {
             appName={startingAppName}
             logs={consoleLogs[startingAppName] ?? []}
             onBack={handleBackFromConsole}
+            onCancel={!isMirrorInstall ? () => handleCancelAppOperation(startingAppName) : undefined}
             isProcessing={isInstallProcessRunning}
             progress={isMirrorInstall ? {
                 value: activeInstallerPercent,
@@ -918,7 +930,7 @@ function App() {
     } else if (currentPage === 'runningAppConsole' && startingAppName) {
         pageContent = <ConsolePage title={t('Console: {{appName}}', {appName: startingAppName})} appName={startingAppName} logs={consoleLogs[startingAppName] ?? []} onBack={handleBackFromConsole} isProcessing={isRunningAppConsoleOpen}/>;
     } else if (currentPage === 'profileChangeConsole' && profileChangeData && startingAppName) {
-        pageContent = <ConsolePage title={t("Changing Profile: {{appName}} to '{{newProfile}}'", { appName: profileChangeData.appName, newProfile: profileChangeData.newProfile })} appName={startingAppName} logs={consoleLogs[startingAppName] ?? []} onBack={handleBackFromConsole} isProcessing={isProfileChangeProcessRunning}/>;
+        pageContent = <ConsolePage title={t("Changing Profile: {{appName}} to '{{newProfile}}'", { appName: profileChangeData.appName, newProfile: profileChangeData.newProfile })} appName={startingAppName} logs={consoleLogs[startingAppName] ?? []} onBack={handleBackFromConsole} onCancel={() => handleCancelAppOperation(startingAppName)} isProcessing={isProfileChangeProcessRunning}/>;
     } else if (currentPage === 'settings') {
         pageContent = <SettingsPage app={app} currentTheme={themeMode} onChangeTheme={setThemeMode} onBack={() => setCurrentPage('list')} updateStatus={updateStatus} clearMessages={clearMessages} />;
     } else if (currentPage === 'profileChooser' && profileChoiceApp) {
@@ -1202,6 +1214,9 @@ function App() {
                                                         appName={app.name}
                                                         logs={consoleLogs[app.name] ?? []}
                                                         onBack={() => handleCloseInlineConsole(app.name)}
+                                                        onCancel={inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
+                                                            ? () => handleCancelAppOperation(app.name)
+                                                            : undefined}
                                                         isProcessing={inlineConsoleKind === 'start'
                                                             ? isStartAppProcessRunning && startingAppName === app.name
                                                             : app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming}

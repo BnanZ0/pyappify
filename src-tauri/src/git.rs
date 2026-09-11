@@ -194,6 +194,9 @@ fn create_transfer_progress_callback(
 ) -> impl FnMut(Progress<'_>) -> bool + 'static {
     let mut last_percent = -1.0;
     move |progress: Progress| {
+        if crate::app_service::app_operation_cancelled() {
+            return false;
+        }
         let received_objects = progress.received_objects();
         let total_objects = progress.total_objects();
         if total_objects > 0 {
@@ -660,6 +663,9 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
         callbacks.transfer_progress({
             let mut last_percent = -1.0;
             move |progress: Progress| {
+                if crate::app_service::app_operation_cancelled() {
+                    return false;
+                }
                 let received_objects = progress.received_objects();
                 let total_objects = progress.total_objects();
                 let indexed_objects = progress.indexed_objects();

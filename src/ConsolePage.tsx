@@ -1,7 +1,8 @@
-import React, {useEffect, useRef} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {openUrl} from '@tauri-apps/plugin-opener';
 import {Alert, Box, Button, CircularProgress, Container, LinearProgress, Link, Paper, Typography} from "@mui/material";
 import {alpha} from '@mui/material/styles';
+import {StopCircle} from '@mui/icons-material';
 import {useTranslation} from 'react-i18next';
 import type {VersionChangeProgress} from './updateProgress';
 
@@ -18,6 +19,7 @@ interface ConsolePageProps {
     appName: string;
     logs: MessagePayload[];
     onBack: () => void;
+    onCancel?: () => Promise<void>;
     isProcessing: boolean;
     progress?: VersionChangeProgress;
     progressAction?: string;
@@ -65,6 +67,7 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                                                      appName,
                                                      logs,
                                                      onBack,
+                                                     onCancel,
                                                      isProcessing,
                                                      progress,
                                                      progressAction,
@@ -77,6 +80,7 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                                                  }) => {
     const {t} = useTranslation();
     const consoleBodyRef = useRef<null | HTMLDivElement>(null);
+    const [cancelPending, setCancelPending] = useState(false);
     const lastFinishedLog = [...logs].reverse().find(log => log.finished);
     const internalIsProcessing = isProcessing && !lastFinishedLog;
     const processCompletedWithError = lastFinishedLog ? !!lastFinishedLog.error : null;
@@ -94,6 +98,16 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
     const alertSeverity = internalIsProcessing
         ? "info"
         : (processCompletedWithError ? "error" : "success");
+
+    const handleCancel = async () => {
+        if (!onCancel || cancelPending) return;
+        setCancelPending(true);
+        try {
+            await onCancel();
+        } catch {
+            setCancelPending(false);
+        }
+    };
 
     const progressPhaseLabels: Record<VersionChangeProgress['phase'], string> = {
         preparing: t('Preparing version change...'),
@@ -214,7 +228,18 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                     <Typography>{t('No logs received yet for {{appName}}.', {appName})}</Typography>}
             </Paper>}
 
-            <Box sx={{pt: 2, display: 'flex', justifyContent: 'flex-end'}}>
+            <Box sx={{pt: 2, display: 'flex', justifyContent: 'flex-end', gap: 1}}>
+                {internalIsProcessing && onCancel && (
+                    <Button
+                        variant="outlined"
+                        color="error"
+                        startIcon={cancelPending ? <CircularProgress size={16}/> : <StopCircle/>}
+                        disabled={cancelPending}
+                        onClick={() => void handleCancel()}
+                    >
+                        {t('Cancel')}
+                    </Button>
+                )}
                 <Button variant="contained" onClick={onBack}>
                     {internalIsProcessing ? t("Back (Process Running)") : t("Done")}
                 </Button>

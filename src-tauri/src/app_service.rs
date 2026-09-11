@@ -50,6 +50,38 @@ static APP_DIR_LOCK: Lazy<Arc<Mutex<()>>> = Lazy::new(|| Arc::new(Mutex::new(())
 static APP_LOAD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 pub static AUTO_START_CHECKED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static AUTO_START_CANCELLED: AtomicBool = AtomicBool::new(false);
+static APP_OPERATION_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn app_operation_cancelled() -> bool {
+    APP_OPERATION_CANCELLED.load(AtomicOrdering::SeqCst)
+}
+
+fn reset_app_operation_cancellation() {
+    APP_OPERATION_CANCELLED.store(false, AtomicOrdering::SeqCst);
+}
+
+struct AppOperationCancellationGuard;
+
+impl AppOperationCancellationGuard {
+    fn start() -> Self {
+        reset_app_operation_cancellation();
+        Self
+    }
+}
+
+impl Drop for AppOperationCancellationGuard {
+    fn drop(&mut self) {
+        reset_app_operation_cancellation();
+    }
+}
+
+fn ensure_app_operation_not_cancelled() -> Result<(), Error> {
+    if app_operation_cancelled() {
+        Err(err!("Operation cancelled by user"))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StartupOverrides {
@@ -1058,6 +1090,7 @@ fn get_profile_for_setup<'a>(
 pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> {
     let app_dir_lock = get_app_lock(app_name).await?;
     let _guard = app_dir_lock.lock().await;
+    let _cancellation_guard = AppOperationCancellationGuard::start();
 
     let repo_path = path::get_app_repo_path(app_name);
     let app = get_app_by_name(app_name).await?;
@@ -1078,6 +1111,7 @@ pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> 
     }
 
     ensure_repository(&app).await?;
+    ensure_app_operation_not_cancelled()?;
 
     let working_dir_path = get_app_working_dir_path(app_name);
     if !repo_path.exists() {
@@ -1091,6 +1125,7 @@ pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> 
         .with_context(|| format!("Failed to create dir {}", working_dir_path.display()))?;
 
     update_working_from_repo(app_name).await?;
+    ensure_app_operation_not_cancelled()?;
 
     let yml_path = working_dir_path.join(YML_FILE_NAME);
     let yml_path_str = yml_path.to_string_lossy().into_owned();
@@ -1106,10 +1141,12 @@ pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> 
     let python_version_spec = &profile_settings_for_setup.requires_python;
     let pip_args = &profile_settings_for_setup.pip_args;
     python_env::setup_python_env(app_name.to_string(), python_version_spec).await?;
+    ensure_app_operation_not_cancelled()?;
 
     if !requirements.is_empty() {
         python_env::install_requirements(app_name, requirements, &working_dir_path, pip_args)
             .await?;
+        ensure_app_operation_not_cancelled()?;
     } else {
         info!(
             "No reqs in profile '{}' of {}. Skipping sync.",
@@ -1240,6 +1277,7 @@ pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Erro
     let _lock_guard = app_dir_lock
         .try_lock()
         .map_err(|_| err!("Another application operation is in progress"))?;
+    let _cancellation_guard = AppOperationCancellationGuard::start();
 
     if get_app_by_name(app_name).await?.update_source == UpdateSource::Mirrorchyan {
         return update_with_installer(app_name, version, false)
@@ -1560,6 +1598,7 @@ async fn ensure_app_stopped_for_update(app_name: &str) -> Result<(), Error> {
 }
 
 async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Error> {
+    ensure_app_operation_not_cancelled()?;
     let working_dir_path = get_app_working_dir_path(app_name);
 
     let (previous_version, old_requirements_spec) = {
@@ -1624,6 +1663,7 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
     };
 
     let commit_oid = git::checkout_version_tag(app_name, &repo_path, version).await?;
+    ensure_app_operation_not_cancelled()?;
     emit_info!(
         app_name,
         "Checked out commit {} for version {}",
@@ -1651,6 +1691,7 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
         }
         return Err(err!("App file synchronization failed: {}", sync_error));
     }
+    ensure_app_operation_not_cancelled()?;
     debug!("Updated working dir for app {}", app_name);
 
     let (new_requirements_spec, new_pip_args) = {
@@ -1726,6 +1767,7 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
             }
             return Err(pip_error);
         }
+        ensure_app_operation_not_cancelled()?;
     } else {
         emit_info!(
             app_name,
@@ -2238,6 +2280,18 @@ async fn kill_app_processes(app_name: &str) -> Result<bool> {
 }
 
 #[tauri::command]
+pub async fn cancel_app_operation(app_name: String) -> Result<(), Error> {
+    info!(
+        "Cancelling the active install/update operation for: {}",
+        app_name
+    );
+    APP_OPERATION_CANCELLED.store(true, AtomicOrdering::SeqCst);
+    kill_app_processes(&app_name).await?;
+    emit_info!(&app_name, "Cancelling the current operation...");
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn stop_app(app_name: String) -> Result<(), Error> {
     info!("Attempting to stop app: {}", app_name);
     let app_dir_lock = get_app_lock(&app_name).await?;
@@ -2416,6 +2470,17 @@ pub async fn periodically_update_app_running_status(app_handle: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_guard_clears_stale_request_when_operation_ends() {
+        super::APP_OPERATION_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _guard = super::AppOperationCancellationGuard::start();
+            assert!(!super::app_operation_cancelled());
+            super::APP_OPERATION_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(!super::app_operation_cancelled());
+    }
+
     #[test]
     fn missing_install_receipt_is_not_treated_as_a_failed_download() {
         let mut app: crate::app::App = serde_yaml::from_str("name: sample\nupdate_source: mirrorchyan\nupdate_state: updating\nupdate_phase: installing\n").unwrap();

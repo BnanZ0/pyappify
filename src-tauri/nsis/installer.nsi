@@ -72,7 +72,8 @@ Var FirstNonCDrive
 Var InvalidDir_ProgramFiles_Msg
 Var InvalidDir_NonASCII_Msg
 Var SetupMutexHandle
-Var UpdateHelperPid
+Var InstallerHelperMode
+Var PreservedLauncher
 Var RequestedInstallDir
 Var RestartManagerSession
 Var RestartManagerError
@@ -481,12 +482,20 @@ Function .onInit
     StrCpy $UpdateMode 1
   ${EndIf}
 
-  Call EnsureSingleSetupInstance
+  ${GetOptions} $CMDLINE "/INSTALLERHELPER" $InstallerHelperMode
+  ${IfNot} ${Errors}
+    StrCpy $InstallerHelperMode 1
+    StrCpy $UpdateMode 1
+    StrCpy $NoShortcutMode 1
+    SetSilent silent
+    ${GetOptions} $CMDLINE "/LAUNCHER=" $PreservedLauncher
+  ${EndIf}
 
-  ${GetOptions} $CMDLINE "/UPDATERPID=" $UpdateHelperPid
+  Call EnsureSingleSetupInstance
 
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     ${If} $PassiveMode = 1
+    ${OrIf} ${Silent}
       System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'
       StrCpy $LANGUAGE $0
       ReadRegStr $0 HKCU "${MANUPRODUCTKEY}" "Installer Language"
@@ -637,7 +646,8 @@ Section WebView2
             ${If} $1 = 0
               DetailPrint "$(webview2InstallSuccess)"
             ${Else}
-              MessageBox MB_ICONEXCLAMATION|MB_ABORTRETRYIGNORE "$(webview2InstallError)" IDIGNORE ignore IDRETRY update_webview
+              MessageBox MB_ICONEXCLAMATION|MB_ABORTRETRYIGNORE "$(webview2InstallError)" /SD IDABORT IDIGNORE ignore IDRETRY update_webview
+              SetErrorLevel 1
               Quit
               ignore:
             ${EndIf}
@@ -656,10 +666,12 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-
-  ; Copy main executable
-  File "${MAINBINARYSRCPATH}"
+  ${If} $InstallerHelperMode <> 1
+    !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+    ; Copy main executable only during a normal setup. MirrorChyan updates
+    ; preserve the launcher so its window stays open throughout installation.
+    File "${MAINBINARYSRCPATH}"
+  ${EndIf}
 
   ; Copy resources
   {{#each resources_dirs}}
@@ -701,15 +713,16 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" $MultiUser.InstallMode 1
   !endif
 
-  ; Remove old main binary if it doesn't match new main binary name
-  ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
-  ${If} $OldMainBinaryName != ""
-  ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
-    Delete "$INSTDIR\$OldMainBinaryName"
+  ${If} $InstallerHelperMode <> 1
+    ; Remove old main binary if it doesn't match new main binary name
+    ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
+    ${If} $OldMainBinaryName != ""
+    ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+      Delete "$INSTDIR\$OldMainBinaryName"
+    ${EndIf}
+    ; Only record a new executable name when it was actually installed.
+    WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
   ${EndIf}
-
-  ; Save current MAINBINARYNAME for future updates
-  WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
 
   ; Registry information for add/remove programs
   WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"
@@ -755,6 +768,9 @@ Section Install
 SectionEnd
 
 Function .onInstSuccess
+  ${If} $InstallerHelperMode = 1
+    Return
+  ${EndIf}
   ; Check for `/R` flag only in silent and passive installers because
   ; GUI installer has a toggle for the user to (re)start the app
   ${If} $PassiveMode = 1
@@ -912,7 +928,7 @@ SectionEnd
 ;                FIXED AND REFACTORED FUNCTION BELOW
 ; =========================================================================
 
-!define VALID_ASCII_CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\`~!@#$%^&*()_+-=[]{}|;':,./<>?$\" "
+!define VALID_ASCII_CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\`~!@#$$%^&*()_+-=[]{}|;':,./<>?$\" "
 
 Function DirectoryLeave
   ; Set messages based on the currently selected language
@@ -1039,6 +1055,13 @@ Function ProbeRestartManagerFile
     Push ""
     Return
   ${EndIf}
+  ${If} $InstallerHelperMode = 1
+    ${If} $R9 == "$INSTDIR\${MAINBINARYNAME}.exe"
+    ${OrIf} $R9 == "$INSTDIR\$PreservedLauncher"
+      Push ""
+      Return
+    ${EndIf}
+  ${EndIf}
   !insertmacro RestartManager_RegisterFile $RestartManagerSession "$R9"
   ${If} $0 != 0
     StrCpy $RestartManagerError $0
@@ -1057,6 +1080,21 @@ Function CloseInstallDirExecutablesWithRestartManager
   ${If} $RestartManagerSession == ""
     StrCpy $RestartManagerError 1
     Return
+  ${EndIf}
+
+  ${If} $InstallerHelperMode = 1
+    ; Protect the launcher even if it holds a registered DLL. RmNoShutdown=2.
+    System::Call 'RSTRTMGR::RmAddFilter(i $RestartManagerSession, w "$INSTDIR\${MAINBINARYNAME}.exe", p 0, p 0, i 2) i .r0'
+    StrCpy $RestartManagerError $0
+    ${If} $RestartManagerError = 0
+    ${AndIf} $PreservedLauncher != ""
+      System::Call 'RSTRTMGR::RmAddFilter(i $RestartManagerSession, w "$INSTDIR\$PreservedLauncher", p 0, p 0, i 2) i .r0'
+      StrCpy $RestartManagerError $0
+    ${EndIf}
+    ${If} $RestartManagerError <> 0
+      !insertmacro RestartManager_EndSession $RestartManagerSession
+      Return
+    ${EndIf}
   ${EndIf}
 
   ${Locate} "$INSTDIR" "/L=F /M=*.exe /G=1" "ProbeRestartManagerFile"
@@ -1103,6 +1141,10 @@ Function KillInstallDirExecutables
   retry_kill_install_dir_executables:
   Call CloseInstallDirExecutablesWithRestartManager
   ${If} $RestartManagerError <> 0
+    ${If} ${Silent}
+      SetErrorLevel $RestartManagerError
+      Abort
+    ${EndIf}
     ${If} $LANGUAGE == 2052
       MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Windows 无法停止正在使用 $INSTDIR 中安装文件的程序（错误 $RestartManagerError）。$\r$\n请关闭相关应用后点击“重试”。" IDRETRY retry_kill_install_dir_executables
     ${Else}

@@ -98,11 +98,12 @@ const installerPhaseLabel = (phase: string): string => ({
     downloading: 'Downloading installer...',
     downloaded: 'Installer downloaded and verified.',
     stopping: 'Stopping the application...',
-    installing: 'Opening installer...',
+    installing: 'Installing application...',
+    completed: 'Installation completed.',
     waiting: 'Waiting for the application to stop...',
     download_failed: 'Installer download failed.',
-    install_failed: 'Installer update failed.',
-} as Record<string, string>)[phase] ?? 'Preparing installer update...';
+    install_failed: 'Installation failed.',
+} as Record<string, string>)[phase] ?? 'Preparing installation...';
 
 const parseVersion = (version: string): ParsedVersion | null => {
     const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:(?:-|\.)(alpha|beta|rc)(?:\.(\d+))?)?$/);
@@ -264,6 +265,7 @@ export type ThemeModeSetting = 'light' | 'dark' | 'system';
 function App() {
     const {t} = useTranslation();
     const [app, setApp] = useState<App | null>(null);
+    const installerProgressRef = useRef<Record<string, string>>({});
     const [installerProgress, setInstallerProgress] = useState<Record<string, {phase: string; downloaded: number; total: number | null}>>({});
     const [status, setStatus] = useState<StatusState>({loading: true, error: null, info: null, messageLoading: false});
     const [appActionLoading, setAppActionLoading] = useState<Record<string, boolean>>({});
@@ -462,11 +464,33 @@ function App() {
 
     const handleInstallWithProfile = async (appName: string, profileName: string) => {
         clearMessages();
+        activeUpdateAppsRef.current.delete(appName);
+        completedAppsRef.current.delete(appName);
+        setInlineConsoles(prev => {
+            const next = {...prev};
+            delete next[appName];
+            return next;
+        });
+        setInlineUpdateLogs(prev => {
+            const next = {...prev};
+            delete next[appName];
+            return next;
+        });
+        delete installerProgressRef.current[appName];
+        setInstallerProgress(prev => ({...prev, [appName]: {phase: 'preparing', downloaded: 0, total: null}}));
         setAppActionLoading(prev => ({...prev, [appName]: true}));
         setStartingAppName(appName);
-        beginConsoleSession(appName, `Initiating install for '${appName}' with profile '${profileName}'...`);
+        beginConsoleSession(appName, app?.update_source === 'mirrorchyan'
+            ? t('Installing App: {{appName}}', {appName})
+            : `Initiating install for '${appName}' with profile '${profileName}'...`);
         setIsInstallProcessRunning(true);
-        setCurrentPage('installConsole');
+        if (app?.update_source === 'mirrorchyan') {
+            activeUpdateAppsRef.current.add(appName);
+            setInlineConsoles(prev => ({...prev, [appName]: 'update'}));
+            setCurrentPage('list');
+        } else {
+            setCurrentPage('installConsole');
+        }
 
         await invokeTauriCommandWrapper<void>("setup_app", {appName, profileName}, () => {},
             (errorMessage, rawError) => {
@@ -478,7 +502,7 @@ function App() {
     };
 
     const handleInstallClick = (app: App) => {
-        if (app.profiles && app.profiles.length > 1) {
+        if (app.update_source !== 'mirrorchyan' && app.profiles && app.profiles.length > 1) {
             setProfileChoiceApp(app);
             const initialProfile = app.profiles.some(p => p.name === app.current_profile)
                 ? app.current_profile
@@ -498,8 +522,17 @@ function App() {
     useEffect(() => {
         const unlistenPromises: Promise<UnlistenFn>[] = [];
         unlistenPromises.push(listen<{app_name: string; phase: string; downloaded: number; total: number | null}>('installer-update-progress', event => {
-            const {app_name, ...progress} = event.payload;
-            setInstallerProgress(previous => ({...previous, [app_name]: progress}));
+            const {app_name, phase, downloaded, total} = event.payload;
+            setInstallerProgress(prev => ({...prev, [app_name]: {phase, downloaded, total}}));
+            // Keep progress in the original log view without flooding it with every chunk.
+            const percent = total ? Math.floor(downloaded / total * 10) * 10 : 0;
+            const key = phase === 'downloading' ? `${phase}:${percent}` : phase;
+            if (installerProgressRef.current[app_name] === key) return;
+            installerProgressRef.current[app_name] = key;
+            const detail = phase === 'downloading' && total
+                ? ` ${(downloaded / 1024 / 1024).toFixed(1)} MB / ${(total / 1024 / 1024).toFixed(1)} MB`
+                : '';
+            addConsoleLog({app_name, message: t(installerPhaseLabel(phase)) + detail, error: phase.endsWith('_failed')});
         }));
         invoke('show_main_window').then();
 
@@ -509,21 +542,28 @@ function App() {
             if (app.update_state === 'updating' && previousUpdateState !== 'updating') {
                 activeUpdateAppsRef.current.add(app.name);
                 setInlineConsoles(prev => ({...prev, [app.name]: 'update'}));
-                const actionType = getVersionActionType(
-                    app.update_target_version ?? '',
-                    app.current_version,
-                    'Upgrade',
-                );
-                ensureActiveConsoleSession(
-                    app.name,
-                    `${getVersionActionProgressKey(actionType)} '${app.name}' to version '${app.update_target_version ?? 'unknown'}'`,
-                );
+                if (app.update_source === 'mirrorchyan') {
+                    setInstallerProgress(prev => ({...prev, [app.name]: {phase: 'preparing', downloaded: 0, total: null}}));
+                    setStartingAppName(app.name);
+                    setIsInstallProcessRunning(true);
+                    ensureActiveConsoleSession(app.name, t('Installing App: {{appName}}', {appName: app.name}));
+                } else {
+                    const actionType = getVersionActionType(
+                        app.update_target_version ?? '',
+                        app.current_version,
+                        'Upgrade',
+                    );
+                    ensureActiveConsoleSession(
+                        app.name,
+                        `${getVersionActionProgressKey(actionType)} '${app.name}' to version '${app.update_target_version ?? 'unknown'}'`,
+                    );
+                }
             }
             appUpdateStatesRef.current[app.name] = app.update_state;
             setApp(app);
             const newSelectedTargets: Record<string, string> = {};
             const inlineLogUpdates: Record<string, InlineUpdateLogState> = {};
-            if (app.update_state !== 'idle' && app.update_target_version) {
+            if (app.installed && app.update_state !== 'idle' && app.update_target_version) {
                 const actionType = getVersionActionType(
                     app.update_target_version,
                     app.current_version,
@@ -637,7 +677,7 @@ function App() {
         return () => {
             Promise.all(unlistenPromises).then(unlisteners => unlisteners.forEach(fn => fn()));
         };
-    }, [addConsoleLog, ensureActiveConsoleSession, updateStatus]);
+    }, [addConsoleLog, ensureActiveConsoleSession, updateStatus, t]);
 
     const handleDeleteApp = async (appName: string) => {
         clearMessages();
@@ -719,7 +759,14 @@ function App() {
             [params.appName]: {...(prev[params.appName] ?? {version: params.version, actionType: params.actionType}), isConfirming: true, completed: false, failed: false}
         }));
         setStartingAppName(params.appName);
-        beginConsoleSession(params.appName, `Initiating ${params.actionType} for '${params.appName}' to version '${params.version}'...`);
+        beginConsoleSession(params.appName, app?.update_source === 'mirrorchyan'
+            ? t('Installing App: {{appName}}', {appName: params.appName})
+            : `Initiating ${params.actionType} for '${params.appName}' to version '${params.version}'...`);
+        if (app?.update_source === 'mirrorchyan') {
+            delete installerProgressRef.current[params.appName];
+            setInstallerProgress(prev => ({...prev, [params.appName]: {phase: 'preparing', downloaded: 0, total: null}}));
+            setIsInstallProcessRunning(true);
+        }
         setInlineConsoles(prev => ({...prev, [params.appName]: 'update'}));
 
         const requirementsFile = app?.profiles?.find(p => p.name === app.current_profile)?.requirements || "requirements.txt";
@@ -767,10 +814,22 @@ function App() {
                     finished: app?.update_state === 'failed',
                 }],
             });
+        if (app?.update_source === 'mirrorchyan') {
+            setIsInstallProcessRunning(app.update_state === 'updating');
+        }
         setInlineConsoles(prev => ({...prev, [appName]: 'update'}));
     };
 
     const handleCloseInlineConsole = async (appName: string) => {
+        if (app?.update_source === 'mirrorchyan' && app.update_state !== 'updating') {
+            setIsInstallProcessRunning(false);
+            setInlineUpdateLogs(prev => {
+                const next = {...prev};
+                delete next[appName];
+                return next;
+            });
+            setSelectedTargetVersions(prev => ({...prev, [appName]: ''}));
+        }
         setInlineConsoles(prev => {
             const next = {...prev};
             delete next[appName];
@@ -892,17 +951,6 @@ function App() {
     };
 
     const isInlineConsoleVisible = currentPage === 'list' && !!app && !!inlineConsoles[app.name];
-    const isCompactMirrorProgress = isInlineConsoleVisible
-        && app?.update_source === 'mirrorchyan'
-        && inlineConsoles[app.name] === 'update';
-    const activeInstallerProgress = startingAppName ? installerProgress[startingAppName] : undefined;
-    const activeInstallerPhase = activeInstallerProgress?.phase ?? app?.update_phase ?? 'downloading';
-    const activeInstallerPercent = activeInstallerProgress?.phase === 'downloading' && activeInstallerProgress.total
-        ? Math.min(100, Math.round(activeInstallerProgress.downloaded / activeInstallerProgress.total * 100))
-        : activeInstallerProgress?.phase === 'downloaded' ? 100 : 0;
-    const activeInstallerDetail = activeInstallerProgress?.phase === 'downloading' && activeInstallerProgress.total
-        ? `${(activeInstallerProgress.downloaded / 1024 / 1024).toFixed(1)} MB / ${(activeInstallerProgress.total / 1024 / 1024).toFixed(1)} MB`
-        : undefined;
     let pageContent;
 
     if (currentPage === 'installConsole' && startingAppName) {
@@ -914,21 +962,17 @@ function App() {
             onBack={handleBackFromConsole}
             onCancel={!isMirrorInstall ? () => handleCancelAppOperation(startingAppName) : undefined}
             isProcessing={isInstallProcessRunning}
-            progress={isMirrorInstall ? {
-                value: activeInstallerPercent,
-                phase: app?.update_state === 'failed' ? 'failed' : 'preparing',
-                requirementsValue: null,
-            } : undefined}
-            hideLogs={isMirrorInstall}
-            progressIndeterminate={isMirrorInstall && !(activeInstallerProgress?.phase === 'downloading' && !!activeInstallerProgress.total)}
-            progressPhaseLabel={isMirrorInstall ? t(installerPhaseLabel(activeInstallerPhase)) : undefined}
-            progressDetail={isMirrorInstall ? activeInstallerDetail : undefined}
-            statusMessage={isMirrorInstall
-                ? app?.update_error ?? t(isInstallProcessRunning ? 'Installer update in progress...' : 'Installer update stopped.')
-                : undefined}
         />;
     } else if (currentPage === 'runningAppConsole' && startingAppName) {
-        pageContent = <ConsolePage title={t('Console: {{appName}}', {appName: startingAppName})} appName={startingAppName} logs={consoleLogs[startingAppName] ?? []} onBack={handleBackFromConsole} isProcessing={isRunningAppConsoleOpen}/>;
+        const isResumedInstallation = app?.name === startingAppName && app.running && !app.installed;
+        pageContent = <ConsolePage
+            title={t('Console: {{appName}}', {appName: startingAppName})}
+            appName={startingAppName}
+            logs={consoleLogs[startingAppName] ?? []}
+            onBack={handleBackFromConsole}
+            onCancel={isResumedInstallation ? () => handleCancelAppOperation(startingAppName) : undefined}
+            isProcessing={isRunningAppConsoleOpen}
+        />;
     } else if (currentPage === 'profileChangeConsole' && profileChangeData && startingAppName) {
         pageContent = <ConsolePage title={t("Changing Profile: {{appName}} to '{{newProfile}}'", { appName: profileChangeData.appName, newProfile: profileChangeData.newProfile })} appName={startingAppName} logs={consoleLogs[startingAppName] ?? []} onBack={handleBackFromConsole} onCancel={() => handleCancelAppOperation(startingAppName)} isProcessing={isProfileChangeProcessRunning}/>;
     } else if (currentPage === 'settings') {
@@ -987,9 +1031,9 @@ function App() {
         pageContent = (
             <Container maxWidth="lg" sx={{
                 py: isInlineConsoleVisible ? 2 : {xs: 2, md: 4},
-                height: isInlineConsoleVisible && !isCompactMirrorProgress ? '100vh' : 'auto',
+                height: isInlineConsoleVisible ? '100vh' : 'auto',
                 boxSizing: 'border-box',
-                overflow: isInlineConsoleVisible && !isCompactMirrorProgress ? 'hidden' : 'visible',
+                overflow: isInlineConsoleVisible ? 'hidden' : 'visible',
             }}>
                 <Snackbar open={snackbarOpen} autoHideDuration={6000} onClose={() => setSnackbarOpen(false)} anchorOrigin={{vertical: 'bottom', horizontal: 'center'}}>
                     <Alert onClose={() => setSnackbarOpen(false)} severity={snackbarSeverity} sx={{width: '100%'}}>{snackbarMessage}</Alert>
@@ -1021,12 +1065,12 @@ function App() {
                             const inlineConsoleKind = inlineConsoles[app.name];
                             const inlineUpdateEntry = inlineUpdateLogs[app.name];
                             const inlineUpdateAction = inlineUpdateEntry?.actionType ?? persistedActionType;
-                            const compactMirrorProgress = inlineConsoleKind === 'update' && app.update_source === 'mirrorchyan';
                             const mirrorProgress = installerProgress[app.name];
-                            const mirrorPhase = mirrorProgress?.phase ?? app.update_phase ?? 'downloading';
-                            const mirrorDownloadPercent = mirrorProgress?.phase === 'downloading' && mirrorProgress.total
-                                ? Math.min(100, Math.round(mirrorProgress.downloaded / mirrorProgress.total * 100))
-                                : mirrorProgress?.phase === 'downloaded' ? 100 : 0;
+                            const mirrorPhase = mirrorProgress?.phase ?? app.update_phase ?? 'preparing';
+                            const mirrorFinishedLog = [...(consoleLogs[app.name] ?? [])].reverse().find(log => log.finished);
+                            const mirrorFailed = app.update_state === 'failed' || mirrorPhase.endsWith('_failed') || !!mirrorFinishedLog?.error;
+                            const mirrorCompleted = !mirrorFailed && (mirrorPhase === 'completed' || !!mirrorFinishedLog);
+                            const mirrorDownloadKnown = mirrorPhase === 'downloading' && !!mirrorProgress?.total;
                             const inlineConsoleProgress = inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
                                 ? calculateVersionChangeProgress(
                                     consoleLogs[app.name] ?? [],
@@ -1041,17 +1085,17 @@ function App() {
                                         width: '100%',
                                         borderColor: app.running ? 'success.main' : 'divider',
                                         bgcolor: 'background.paper',
-                                        overflow: inlineConsoleKind && !compactMirrorProgress ? 'hidden' : 'visible',
-                                        height: inlineConsoleKind && !compactMirrorProgress ? '100%' : 'auto',
+                                        overflow: inlineConsoleKind ? 'hidden' : 'visible',
+                                        height: inlineConsoleKind ? '100%' : 'auto',
                                     }}
                                 >
                                     <CardContent sx={{
                                         p: {xs: 2, sm: 3},
                                         '&:last-child': {pb: {xs: 2, sm: 3}},
-                                        height: inlineConsoleKind && !compactMirrorProgress ? '100%' : 'auto',
+                                        height: inlineConsoleKind ? '100%' : 'auto',
                                         boxSizing: 'border-box',
-                                        display: inlineConsoleKind && !compactMirrorProgress ? 'flex' : 'block',
-                                        flexDirection: inlineConsoleKind && !compactMirrorProgress ? 'column' : undefined,
+                                        display: inlineConsoleKind ? 'flex' : 'block',
+                                        flexDirection: inlineConsoleKind ? 'column' : undefined,
                                     }}>
                                         <Stack direction={{xs: 'column', sm: 'row'}} spacing={2} sx={{justifyContent: 'space-between', alignItems: {xs: 'stretch', sm: 'flex-start'}}}>
                                             <Stack direction="row" spacing={1.5} sx={{minWidth: 0, alignItems: 'center'}}>
@@ -1102,10 +1146,10 @@ function App() {
                                                             <Chip size="small" variant="outlined" label={app.current_profile}/>
                                                         )}
                                                         {app.update_state === 'updating' && (
-                                                            <Chip size="small" color="info" icon={<CircularProgress size={14}/>} label={t(getVersionActionProgressKey(persistedActionType))}/>
+                                                            <Chip size="small" color="info" icon={<CircularProgress size={14}/>} label={t(app.update_source === 'mirrorchyan' ? '(Installing...)' : getVersionActionProgressKey(persistedActionType))}/>
                                                         )}
                                                         {app.update_state === 'failed' && (
-                                                            <Chip size="small" color="error" label={t(`${persistedActionType} failed`)}/>
+                                                            <Chip size="small" color="error" label={t(app.update_source === 'mirrorchyan' ? 'Installation failed.' : `${persistedActionType} failed`)}/>
                                                         )}
                                                     </Stack>
                                                 </Box>
@@ -1130,7 +1174,7 @@ function App() {
                                                 ) : isEffectivelyInstalling ? (
                                                     <Button variant="outlined" color="info" size="small" startIcon={<OpenInNew/>} onClick={() => handleOpenRunningAppConsole(app.name)} disabled={disableRowActions}>{t('Console')}</Button>
                                                 ) : (
-                                                    <Button variant="contained" color="primary" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <Build/>} endIcon={<KeyboardArrowRight/>} onClick={() => handleInstallClick(app)} disabled={disableRowActions}>{t("Install")}</Button>
+                                                    <Button variant="contained" color="primary" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <Build/>} endIcon={<KeyboardArrowRight/>} onClick={() => handleInstallClick(app)} disabled={disableUpdateControls}>{t("Install")}</Button>
                                                 )}
                                                 {app.show_add_defender && !hiddenDefenderButtons.has(app.name) && <Button variant="outlined" color="secondary" size="small" startIcon={isThisAppLoading && addingDefenderExclusionForApp === app.name ? <CircularProgress size={16}/> : <Build/>} onClick={() => handleAddDefenderExclusion(app.name)} disabled={disableRowActions}>{t("Add Defender Exclusion")}</Button>}
                                                 {app.installed && !app.running && app.profiles?.length > 1 && <Button variant="outlined" color="secondary" size="small" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <Cached/>} onClick={() => handleNavigateToChangeProfilePage(app)} disabled={disableRowActions}>{t("Change Profile")}</Button>}
@@ -1154,20 +1198,20 @@ function App() {
                                                 </Tooltip>
                                             </Stack>
                                         </Stack>
-                                        {app.installed && (!app.running || !!inlineConsoleKind) && (
+                                        {((app.installed && !app.running) || !!inlineConsoleKind) && (
                                             <Box
                                                 sx={{
                                                     mt: 2.5,
                                                     p: {xs: 1.5, sm: 2},
                                                     borderRadius: 3,
                                                     bgcolor: theme => alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.075 : 0.045),
-                                                    flex: inlineConsoleKind && !compactMirrorProgress ? '1 1 auto' : undefined,
-                                                    minHeight: inlineConsoleKind && !compactMirrorProgress ? 0 : undefined,
-                                                    display: inlineConsoleKind && !compactMirrorProgress ? 'flex' : 'block',
-                                                    flexDirection: inlineConsoleKind && !compactMirrorProgress ? 'column' : undefined,
+                                                    flex: inlineConsoleKind ? '1 1 auto' : undefined,
+                                                    minHeight: inlineConsoleKind ? 0 : undefined,
+                                                    display: inlineConsoleKind ? 'flex' : 'block',
+                                                    flexDirection: inlineConsoleKind ? 'column' : undefined,
                                                 }}
                                             >
-                                                {!app.running && (
+                                                {app.installed && !app.running && (
                                                     <Stack direction={{xs: 'column', sm: 'row'}} spacing={1} sx={{alignItems: {xs: 'stretch', sm: 'center'}}}>
                                                         <FormControl size="small" sx={{minWidth: {xs: '100%', sm: 220}}} disabled={disableUpdateControls}>
                                                             <InputLabel>{t('Update Method')}</InputLabel>
@@ -1210,7 +1254,9 @@ function App() {
                                                         inline
                                                         title={inlineConsoleKind === 'start'
                                                             ? t('Starting App: {{appName}}', {appName: app.name})
-                                                            : t('{{actionType}} App: {{appName}}', {actionType: t(inlineUpdateAction), appName: app.name})}
+                                                            : app.update_source === 'mirrorchyan'
+                                                                ? t('Installing App: {{appName}}', {appName: app.name})
+                                                                : t('{{actionType}} App: {{appName}}', {actionType: t(inlineUpdateAction), appName: app.name})}
                                                         appName={app.name}
                                                         logs={consoleLogs[app.name] ?? []}
                                                         onBack={() => handleCloseInlineConsole(app.name)}
@@ -1219,23 +1265,20 @@ function App() {
                                                             : undefined}
                                                         isProcessing={inlineConsoleKind === 'start'
                                                             ? isStartAppProcessRunning && startingAppName === app.name
-                                                            : app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming}
-                                                        progress={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'
-                                                            ? {value: mirrorDownloadPercent, phase: app.update_state === 'failed' ? 'failed' : 'preparing', requirementsValue: null}
-                                                            : inlineConsoleProgress}
-                                                        progressAction={inlineConsoleKind === 'update' ? t(inlineUpdateAction) : undefined}
-                                                        hideLogs={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'}
-                                                        progressIndeterminate={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'
-                                                            && !(mirrorProgress?.phase === 'downloading' && !!mirrorProgress.total)}
-                                                        progressPhaseLabel={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'
-                                                            ? t(installerPhaseLabel(mirrorPhase)) : undefined}
-                                                        progressDetail={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'
-                                                            && mirrorProgress?.phase === 'downloading' && mirrorProgress.total
-                                                            ? `${(mirrorProgress.downloaded / 1024 / 1024).toFixed(1)} MB / ${(mirrorProgress.total / 1024 / 1024).toFixed(1)} MB`
-                                                            : undefined}
-                                                        statusMessage={app.update_source === 'mirrorchyan' && inlineConsoleKind === 'update'
-                                                            ? app.update_error ?? t(app.update_state === 'updating' ? 'Installer update in progress...' : 'Installer update stopped.')
-                                                            : undefined}
+                                                            : app.update_source === 'mirrorchyan'
+                                                                ? isInstallProcessRunning || app.update_state === 'updating'
+                                                                : app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming}
+                                                        progress={inlineConsoleKind === 'update' && app.update_source === 'mirrorchyan'
+                                                            ? {
+                                                                value: mirrorCompleted ? 100 : mirrorDownloadKnown
+                                                                    ? Math.min(100, Math.round(mirrorProgress.downloaded / mirrorProgress.total! * 100)) : 0,
+                                                                phase: mirrorFailed ? 'failed' : mirrorCompleted ? 'complete' : 'preparing',
+                                                                requirementsValue: null,
+                                                                indeterminate: !mirrorFailed && !mirrorCompleted && !mirrorDownloadKnown,
+                                                                phaseLabel: t(installerPhaseLabel(mirrorFailed ? 'install_failed' : mirrorCompleted ? 'completed' : mirrorPhase)),
+                                                            } : inlineConsoleProgress}
+                                                        progressAction={inlineConsoleKind === 'update'
+                                                            ? t(app.update_source === 'mirrorchyan' ? 'Install' : inlineUpdateAction) : undefined}
                                                     />
                                                 ) : inlineUpdateEntry && (
                                                     <UpdateLogPage

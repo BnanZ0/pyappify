@@ -1,4 +1,4 @@
-//! Out-of-process NSIS handoff. The helper is a temporary copy of this binary.
+//! Out-of-process NSIS installation while the original launcher stays open.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +19,8 @@ pub struct Transaction {
     previous_version: Option<String>,
     #[serde(default)]
     update_note: Vec<String>,
+    #[serde(default)]
+    previous_install_failed: bool,
     parent_pid: u32,
     #[serde(default)]
     helper_pid: Option<u32>,
@@ -75,9 +77,13 @@ fn write_transaction(dir: &Path, tx: &Transaction) -> Result<()> {
     atomic_write(&dir.join("transaction.json"), &serde_json::to_vec(tx)?)
 }
 
-/// Start a helper and wait until it owns a handle to this process. No installer
-/// can run until the caller explicitly commits AND this process has exited.
-pub async fn prepare(app: &crate::app::App, target: &str, dir: &Path) -> Result<()> {
+/// Start a helper and wait until it owns a handle to this process. Installation
+/// starts only after the caller commits, while the original launcher is alive.
+pub async fn prepare(
+    app: &crate::app::App,
+    target: &str,
+    dir: &Path,
+) -> Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let tx = Transaction {
         install_dir: crate::utils::path::get_cwd().canonicalize()?,
@@ -90,6 +96,7 @@ pub async fn prepare(app: &crate::app::App, target: &str, dir: &Path) -> Result<
         target: target.into(),
         previous_version: app.current_version.clone(),
         update_note: app.update_note.clone(),
+        previous_install_failed: app.update_state == crate::app::AppUpdateState::Failed,
         parent_pid: std::process::id(),
         helper_pid: None,
         update_method: app.update_method.clone(),
@@ -117,7 +124,7 @@ pub async fn prepare(app: &crate::app::App, target: &str, dir: &Path) -> Result<
         .context("Could not start the installer helper")?;
     for _ in 0..150 {
         if dir.join("ready").exists() {
-            return Ok(());
+            return Ok(child);
         }
         if child.try_wait()?.is_some() {
             bail!("Installer helper exited before becoming ready");
@@ -130,6 +137,14 @@ pub async fn prepare(app: &crate::app::App, target: &str, dir: &Path) -> Result<
 
 pub fn commit(dir: &Path) -> Result<()> {
     atomic_write(&dir.join("commit"), b"ready")
+}
+
+pub async fn wait(mut helper: std::process::Child) -> Result<()> {
+    let status = tokio::task::spawn_blocking(move || helper.wait()).await??;
+    if !status.success() {
+        bail!("Installer helper exited unexpectedly ({status})");
+    }
+    Ok(())
 }
 pub fn cancel(dir: &Path) {
     let _ = atomic_write(&dir.join("abort"), b"abort");
@@ -157,73 +172,6 @@ fn validate_transaction(tx: &Transaction) -> Result<()> {
     {
         bail!("Invalid installation directory");
     }
-    Ok(())
-}
-
-fn resolve_installed_executable(install_dir: &Path, expected: &str) -> Result<PathBuf> {
-    let expected_path = install_dir.join(expected);
-    if expected_path.is_file() {
-        return Ok(expected_path);
-    }
-
-    // Development builds run as `target/debug/pyappify.exe`, while a project
-    // setup can install a branded executable such as `ok-nte.exe`. The setup
-    // has already completed successfully at this point, so use its sole main
-    // executable when the pre-update process name no longer exists.
-    let candidates: Vec<_> = std::fs::read_dir(install_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-        })
-        .filter(|path| {
-            !path
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("uninstall.exe"))
-        })
-        .collect();
-    match candidates.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        [] => bail!(
-            "The installer completed, but no application executable was found in {}",
-            install_dir.display()
-        ),
-        _ => bail!(
-            "The installer completed, but the application executable could not be identified in {}",
-            install_dir.display()
-        ),
-    }
-}
-
-#[cfg(windows)]
-fn launch_installed_executable(executable: &Path, install_dir: &Path) -> Result<()> {
-    use windows_sys::Win32::UI::{Shell::*, WindowsAndMessaging::SW_SHOWNORMAL};
-
-    let file = wide(executable);
-    let cwd = wide(install_dir);
-    unsafe {
-        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.fMask = SEE_MASK_NOASYNC;
-        info.lpFile = file.as_ptr();
-        info.lpDirectory = cwd.as_ptr();
-        info.nShow = SW_SHOWNORMAL;
-        if ShellExecuteExW(&mut info) == 0 {
-            bail!(
-                "Windows could not start the updated launcher ({})",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn launch_installed_executable(executable: &Path, install_dir: &Path) -> Result<()> {
-    std::process::Command::new(executable)
-        .current_dir(install_dir)
-        .spawn()?;
     Ok(())
 }
 
@@ -258,15 +206,15 @@ pub fn try_helper() -> bool {
         result
     })();
     if let Err(error) = result {
-        show_error(&format!("Automatic update could not finish: {error}"));
+        // The live launcher reads the durable receipt and displays the error.
+        // Helpers must not display an extra GUI, including on installation failure.
+        eprintln!("Automatic update could not finish: {error}");
     }
     true
 }
 
 fn record_helper_failure(tx: &mut Transaction, error: &anyhow::Error) {
-    // Reopening the launcher happens after a successful installer result was
-    // durably recorded. A restart failure must not turn that install into a
-    // failed update when the user starts the new launcher manually.
+    // A receipt write failure must not replace an already confirmed install.
     if tx.state == "succeeded" {
         return;
     }
@@ -313,20 +261,18 @@ fn run_helper(dir: &Path, tx: &mut Transaction) -> Result<()> {
         }
         let exited = unsafe { WaitForSingleObject(parent.0, 100) } == WAIT_OBJECT_0;
         if exited {
-            if !dir.join("commit").exists() {
-                return Ok(());
-            }
+            return Ok(());
+        }
+        if dir.join("commit").exists() {
             break;
         }
         if std::time::Instant::now() > deadline {
-            bail!(
-                "Timed out waiting for the original launcher to exit; installation was not started"
-            );
+            bail!("Timed out waiting for the launcher to commit; installation was not started");
         }
     }
     tx.state = "installing".into();
     write_transaction(dir, tx)?;
-    let result = launch_installer(&dir.join("setup.exe"), &tx.install_dir);
+    let result = launch_installer(&dir.join("setup.exe"), &tx.install_dir, &tx.executable);
     match result {
         Ok(0) => {
             tx.state = "succeeded".into();
@@ -345,21 +291,14 @@ fn run_helper(dir: &Path, tx: &mut Transaction) -> Result<()> {
         }
     }
     write_transaction(dir, tx)?;
-    // No /R: only this helper restarts, after the durable result is available.
-    let installed_executable = resolve_installed_executable(&tx.install_dir, &tx.executable)?;
-    launch_installed_executable(&installed_executable, &tx.install_dir).with_context(|| {
-        format!(
-            "Could not reopen the launcher. Run {} to repair the installation.",
-            dir.join("setup.exe").display()
-        )
-    })
+    Ok(())
 }
 #[cfg(not(windows))]
 fn run_helper(_: &Path, _: &mut Transaction) -> Result<()> {
     bail!("Installer updates require Windows")
 }
 
-fn installer_parameters(install_dir: &Path, helper_pid: u32) -> String {
+fn installer_parameters(install_dir: &Path, launcher: &str) -> String {
     // NSIS consumes everything after /D=, unquoted; this MUST be the last argument.
     let path = install_dir.to_string_lossy();
     let path = if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
@@ -367,18 +306,18 @@ fn installer_parameters(install_dir: &Path, helper_pid: u32) -> String {
     } else {
         path.strip_prefix("\\\\?\\").unwrap_or(&path).to_string()
     };
-    format!("/P /UPDATE /UPDATERPID={helper_pid} /D={path}")
+    format!("/S /UPDATE /INSTALLERHELPER /LAUNCHER=\"{launcher}\" /D={path}")
 }
 
 #[cfg(windows)]
-fn launch_installer(setup: &Path, install_dir: &Path) -> Result<u32> {
+fn launch_installer(setup: &Path, install_dir: &Path, launcher: &str) -> Result<u32> {
     use windows_sys::Win32::{
         System::{Com::*, Threading::*},
-        UI::{Shell::*, WindowsAndMessaging::SW_SHOWNORMAL},
+        UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
     };
     crate::mirrorchyan::validate_pe(setup)?;
     let file = wide(setup);
-    let parameters = wide(installer_parameters(install_dir, std::process::id()));
+    let parameters = wide(installer_parameters(install_dir, launcher));
     let cwd = wide(setup.parent().context("Missing installer directory")?);
     unsafe {
         let initialized = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0;
@@ -388,7 +327,7 @@ fn launch_installer(setup: &Path, install_dir: &Path) -> Result<u32> {
         info.lpFile = file.as_ptr();
         info.lpParameters = parameters.as_ptr();
         info.lpDirectory = cwd.as_ptr();
-        info.nShow = SW_SHOWNORMAL;
+        info.nShow = SW_HIDE;
         let success = ShellExecuteExW(&mut info);
         if initialized {
             CoUninitialize();
@@ -410,22 +349,6 @@ fn launch_installer(setup: &Path, install_dir: &Path) -> Result<u32> {
         }
         Ok(code)
     }
-}
-
-#[cfg(windows)]
-fn show_error(message: &str) {
-    unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            std::ptr::null_mut(),
-            wide(message).as_ptr(),
-            wide("PyAppify update").as_ptr(),
-            0x10,
-        );
-    }
-}
-#[cfg(not(windows))]
-fn show_error(message: &str) {
-    eprintln!("{message}");
 }
 
 /// Apply only launcher preferences and the confirmed version, not an old App
@@ -463,6 +386,22 @@ pub fn consume_result(app: &mut crate::app::App) -> Result<()> {
     // discard the only successful-install record.
     Ok(())
 }
+
+/// Consume a helper's terminal receipt in the still-running launcher. A missing
+/// or unfinished receipt must never be reported as a successful installation.
+pub fn consume_completed_result(app: &mut crate::app::App, dir: &Path) -> Result<()> {
+    let tx: Transaction = serde_json::from_slice(&std::fs::read(dir.join("transaction.json"))?)?;
+    validate_transaction(&tx)?;
+    if tx.install_dir != crate::utils::path::get_cwd().canonicalize()?
+        || tx.app_name != app.name
+        || !matches!(tx.state.as_str(), "succeeded" | "failed" | "not_started")
+    {
+        bail!("The installer result is unconfirmed or does not match this application");
+    }
+    SKIP_AUTO_UPDATE.store(true, Ordering::SeqCst);
+    apply_result(app, tx, dir);
+    Ok(())
+}
 fn apply_result(app: &mut crate::app::App, tx: Transaction, dir: &Path) {
     app.update_source = crate::mirrorchyan::UpdateSource::Mirrorchyan;
     app.update_method = tx.update_method;
@@ -481,8 +420,12 @@ fn apply_result(app: &mut crate::app::App, tx: Transaction, dir: &Path) {
             app.installed = true;
         }
         "not_started" | "prepared" if tx.state == "not_started" || !dir.join("commit").exists() => {
-            app.update_state = crate::app::AppUpdateState::Idle;
-            app.update_phase = None;
+            app.update_state = if tx.previous_install_failed {
+                crate::app::AppUpdateState::Failed
+            } else {
+                crate::app::AppUpdateState::Idle
+            };
+            app.update_phase = tx.previous_install_failed.then(|| "install_failed".into());
             app.update_error = Some(tx.error.unwrap_or_else(|| {
                 "The previous update stopped before installation. You can retry.".into()
             }));
@@ -548,6 +491,7 @@ mod tests {
             target: "v2.0.0".into(),
             previous_version: Some("v1.0.0".into()),
             update_note: vec!["New release".into()],
+            previous_install_failed: false,
             parent_pid: std::process::id(),
             helper_pid: None,
             update_method: "MANUAL_UPDATE".into(),
@@ -603,10 +547,10 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
     #[test]
-    fn restart_failure_does_not_replace_successful_install_result() {
+    fn receipt_failure_does_not_replace_successful_install_result() {
         let dir = new_task_dir().unwrap();
         let mut tx = transaction(&dir, "succeeded");
-        record_helper_failure(&mut tx, &anyhow::anyhow!("launcher could not restart"));
+        record_helper_failure(&mut tx, &anyhow::anyhow!("receipt could not be written"));
         assert_eq!(tx.state, "succeeded");
         assert!(tx.error.is_none());
         std::fs::remove_dir(dir).unwrap();
@@ -638,9 +582,56 @@ mod tests {
     #[test]
     fn nsis_destination_is_last_and_unquoted() {
         assert_eq!(
-            installer_parameters(Path::new(r"C:\My App"), 42),
-            r"/P /UPDATE /UPDATERPID=42 /D=C:\My App"
+            installer_parameters(Path::new(r"C:\My App"), "my launcher.exe"),
+            r#"/S /UPDATE /INSTALLERHELPER /LAUNCHER="my launcher.exe" /D=C:\My App"#
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn committed_helper_runs_while_launcher_is_alive() {
+        let dir = new_task_dir().unwrap();
+        let mut tx = transaction(&dir, "prepared");
+        atomic_write(&dir.join("commit"), b"ready").unwrap();
+        // No setup is provided: reaching its validation proves the helper did
+        // not wait for this test process to exit, without installing anything.
+        run_helper(&dir, &mut tx).unwrap();
+        assert!(dir.join("ready").exists());
+        assert_eq!(tx.state, "not_started");
+        assert!(tx.error.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn live_launcher_rejects_missing_unfinished_and_mismatched_receipts() {
+        let dir = new_task_dir().unwrap();
+        let mut app = application();
+        assert!(consume_completed_result(&mut app, &dir).is_err());
+        let mut tx = transaction(
+            &crate::utils::path::get_cwd().canonicalize().unwrap(),
+            "prepared",
+        );
+        for state in ["prepared", "installing"] {
+            tx.state = state.into();
+            write_transaction(&dir, &tx).unwrap();
+            assert!(consume_completed_result(&mut app, &dir).is_err());
+        }
+        tx.state = "succeeded".into();
+        tx.app_name = "another-app".into();
+        write_transaction(&dir, &tx).unwrap();
+        assert!(consume_completed_result(&mut app, &dir).is_err());
+        assert_eq!(app.current_version.as_deref(), Some("v1.0.0"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn cancelled_repair_does_not_unblock_a_failed_installation() {
+        let dir = new_task_dir().unwrap();
+        let mut app = application();
+        let mut tx = transaction(&dir, "not_started");
+        tx.previous_install_failed = true;
+        apply_result(&mut app, tx, &dir);
+        assert_eq!(app.update_state, crate::app::AppUpdateState::Failed);
+        assert_eq!(app.update_phase.as_deref(), Some("install_failed"));
+        assert_eq!(app.current_version.as_deref(), Some("v1.0.0"));
+        std::fs::remove_dir(dir).unwrap();
     }
     #[test]
     fn atomic_write_replaces_existing_file() {
@@ -651,16 +642,5 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
-    }
-    #[test]
-    fn branded_installer_executable_is_used_when_development_name_is_absent() {
-        let dir = new_task_dir().unwrap();
-        std::fs::write(dir.join("ok-nte.exe"), b"test").unwrap();
-        std::fs::write(dir.join("uninstall.exe"), b"test").unwrap();
-        assert_eq!(
-            resolve_installed_executable(&dir, "pyappify.exe").unwrap(),
-            dir.join("ok-nte.exe")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

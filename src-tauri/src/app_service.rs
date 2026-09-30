@@ -1393,11 +1393,11 @@ async fn set_installer_phase(app_name: &str, phase: &str) -> Result<()> {
     Ok(())
 }
 
-/// Caller owns APP_DIR_LOCK throughout download and handoff. Stop the Python
+/// Caller owns APP_DIR_LOCK throughout download and installation. Stop the Python
 /// processes directly here rather than recursively acquiring that lock.
 #[derive(PartialEq)]
 enum InstallerOutcome {
-    HandedOff,
+    Completed,
     Deferred,
 }
 
@@ -1422,6 +1422,8 @@ async fn update_with_installer(
         None,
     )
     .await?;
+    let mut committed = false;
+    let mut result_applied = false;
     let result: Result<InstallerOutcome> = async {
         set_installer_phase(app_name, "downloading").await?;
         let mut request_app = get_app().await.context("Application not loaded")?;
@@ -1439,8 +1441,9 @@ async fn update_with_installer(
         {
             return Ok(InstallerOutcome::Deferred);
         }
-        let handoff_app = get_app_by_name(app_name).await?;
-        installer_update::prepare(&handoff_app, version, &dir).await?;
+        let mut helper_app = get_app_by_name(app_name).await?;
+        helper_app.update_state = app.update_state.clone();
+        let helper = installer_update::prepare(&helper_app, version, &dir).await?;
         set_installer_phase(app_name, "stopping").await?;
         if automatic {
             if ensure_app_stopped_for_update(app_name).await.is_err() {
@@ -1457,11 +1460,33 @@ async fn update_with_installer(
         }
         ensure_app_stopped_for_update(app_name).await?;
         set_installer_phase(app_name, "installing").await?;
-        let handle = get_app_handle()
-            .context("The installer update must be started from the launcher window")?;
         installer_update::commit(&dir)?;
-        handle.exit(0);
-        Ok(InstallerOutcome::HandedOff)
+        committed = true;
+        installer_update::wait(helper).await?;
+        let mut updated_app = get_app_by_name(app_name).await?;
+        installer_update::consume_completed_result(&mut updated_app, &dir)?;
+        if updated_app.update_state == AppUpdateState::Idle && updated_app.update_error.is_none() {
+            // Read the newly installed YAML, rather than keeping the old profiles
+            // from this launcher's embedded configuration.
+            load_app_details(&mut updated_app).await?;
+            updated_app.current_version_missing = false;
+            updated_app.running = false;
+        }
+        let installation_error = updated_app.update_error.clone();
+        *APP.lock().await = Some(updated_app.clone());
+        result_applied = true;
+        let save_result = save_app_config_to_json(&updated_app).await;
+        // Publish the applied result even if persistence fails, so the UI does
+        // not remain locked in Updating. Keep the receipt until saving succeeds.
+        emit_app().await;
+        save_result.context("Failed to save installation result")?;
+        installer_update::acknowledge_result();
+        if let Some(error) = installation_error {
+            bail!("{error}");
+        }
+        mirrorchyan::progress(app_name, "completed", 0, None);
+        emit_success_finish!(app_name);
+        Ok(InstallerOutcome::Completed)
     }
     .await;
     if matches!(result, Ok(InstallerOutcome::Deferred)) {
@@ -1471,32 +1496,46 @@ async fn update_with_installer(
         return Ok(InstallerOutcome::Deferred);
     }
     if let Err(error) = result {
-        installer_update::cancel(&dir);
-        persist_update_state(
+        if !committed {
+            installer_update::cancel(&dir);
+        }
+        if !result_applied {
+            persist_update_state(
+                app_name,
+                if previously_failed || committed {
+                    AppUpdateState::Failed
+                } else {
+                    AppUpdateState::Idle
+                },
+                Some(version.into()),
+                Some(error.to_string()),
+            )
+            .await?;
+            set_installer_phase(
+                app_name,
+                if previously_failed || committed {
+                    "install_failed"
+                } else {
+                    "download_failed"
+                },
+            )
+            .await?;
+        }
+        mirrorchyan::progress(
             app_name,
-            if previously_failed {
-                AppUpdateState::Failed
-            } else {
-                AppUpdateState::Idle
-            },
-            Some(version.into()),
-            Some(error.to_string()),
-        )
-        .await?;
-        set_installer_phase(
-            app_name,
-            if previously_failed {
+            if committed || previously_failed {
                 "install_failed"
             } else {
                 "download_failed"
             },
-        )
-        .await?;
+            0,
+            None,
+        );
         emit_error!(app_name, "{}", error);
         emit_error_finish!(app_name);
         return Err(error.into());
     }
-    Ok(InstallerOutcome::HandedOff)
+    Ok(InstallerOutcome::Completed)
 }
 
 async fn mirror_startup() {
@@ -1543,7 +1582,7 @@ async fn mirror_startup() {
         }
         match update_with_installer(&app.name, &release.version_name, true).await {
             Ok(InstallerOutcome::Deferred) => continue,
-            Ok(InstallerOutcome::HandedOff) => return,
+            Ok(InstallerOutcome::Completed) => break,
             Err(error) => {
                 emit_error!(&app.name, "{}", error);
                 return;

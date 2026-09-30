@@ -23,8 +23,9 @@ for resources uploaded as generic packages.
 The selected resource must return the complete NSIS installer, not a ZIP,
 incremental package, source archive, or a bare launcher executable. The installer
 must retain the application identity, main executable name and installation
-layout, and include a launcher with this integration. Publishing/uploading that
-installer is external to this feature; the existing packaging workflow and
+layout, and use the NSIS template with `/INSTALLERHELPER` support. Existing
+installers without that support must be rebuilt before use with this workflow.
+Publishing/uploading that installer is external to this feature; the existing packaging workflow and
 pyappify-action are not changed.
 
 Users select **Git + pip** or **Mirror酱** in Settings. Git remains the default.
@@ -60,20 +61,27 @@ for this progress bar.
 The launcher copies itself into a unique Windows temporary directory and starts
 that copy with `--installer-helper`. This internal mode runs before Tauri or
 single-instance initialization. A ready/commit handshake and a Windows process
-handle ensure NSIS starts only after the original launcher exits. Closing the
-launcher before committing does not start the installer.
+handle ensure NSIS starts only after the original launcher commits while it is
+still running. Closing the launcher before committing does not start the installer.
 
-The helper runs setup with `/P /UPDATE /UPDATERPID=<pid> /D=<original directory>`.
-`/D=` is last and follows NSIS's unquoted-directory convention. The passive
-installer displays progress and skips normal wizard and language-selection
-pages. UAC and exceptional installation-error dialogs may still appear. Resource
-copying and user-file handling are exactly those of the existing installer.
+The helper runs setup with
+`/S /UPDATE /INSTALLERHELPER /LAUNCHER="<original executable name>" /D=<original directory>`.
+`/D=` is last and follows NSIS's unquoted-directory convention. The installer
+runs silently, without wizard, progress, language-selection or error dialogs.
+Windows may still request UAC approval. In helper mode NSIS skips the launcher
+EXE when registering files with Restart Manager, protects the launcher from
+shutdown, and skips checking, overwriting or removing the launcher EXE. Resource
+copying and user-file handling otherwise follow the existing installer.
 
-The helper waits for the installer exit code, records the result, and starts the
-launcher once. It does not pass `/R`, so NSIS does not start a second copy. The
-new launcher restores the saved source, update policy, auto-start preference and
-profile, confirms the application version, and skips automatic updating for that
-launch. Python application startup still follows the saved auto-start preference.
+The helper waits for the installer exit code and records the result. The original
+launcher stays open, waits asynchronously for the helper, and displays completion
+or failure in its existing console. Neither the helper nor NSIS restarts it.
+On success the launcher reloads profiles and metadata from the installed YAML,
+preserves preferences, and confirms the application version. Automatic startup
+updates then continue with the saved Python auto-start preference.
+
+MirrorChyan updates deliberately preserve the existing launcher binary. Deliver
+launcher code or embedded UI changes through a normal complete setup instead.
 
 ## Storage and recovery
 
@@ -90,10 +98,10 @@ The same private directory contains `pending.json`, pointing to a transaction in
 `%TEMP%\pyappify-update-<random>`. That transaction stores paths, version,
 preferences and installation result, but no CDK or download URL. Temporary
 installers remain available for retry/manual repair; they may be removed after
-the update has finished and the launcher has restarted.
+the update has finished.
 
 - Download/preparation failures leave the current application usable.
-- UAC cancellation or failure to launch setup reopens the launcher with an error
+- UAC cancellation or failure to launch setup leaves the launcher open with an error
   without advancing the version.
 - An installer failure or interrupted installation blocks application startup
   until repaired; no automatic rollback is claimed. Check for updates and retry,
@@ -122,9 +130,10 @@ Before enabling a real resource, test two complete versions in a Windows VM:
    locations used by the application.
 2. Trigger a manual update while the application is running. Confirm download
    happens first, the application stops, setup uses the original directory, no
-   wizard choices are required, and the launcher restarts exactly once.
-3. Check the new launcher/application versions, preferences, expected user files
-   and Python startup. Verify there was no Git or pip operation in the update.
+   installer GUI appears, and the launcher window and process remain open.
+3. Check the updated application version, unchanged launcher binary, preferences,
+   expected user files and Python startup. Verify there was no Git or pip operation
+   in the update.
 4. Test automatic update while an application is running and an application
    started externally during download. Installation must wait for it to stop.
 5. Test an expired CDK, interrupted download, denied UAC, cancelled setup, file

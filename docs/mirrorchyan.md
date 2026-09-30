@@ -118,6 +118,60 @@ the update has finished.
 
 ## Validation
 
+### Local setup testing (Windows debug builds)
+
+Local testing uses a script and the launcher's existing **Install** or **Upgrade** button.
+Debug builds can replace the MirrorChyan release lookup and download with a
+local setup EXE through environment variables; no CDK or API request is needed.
+Application stopping, helper, silent NSIS installation and receipt handling
+follow the ordinary update flow.
+
+Run this from the repository root:
+
+```powershell
+.\scripts\start-local-setup-test.ps1
+```
+
+To test the installation page instead, run:
+
+```powershell
+.\scripts\start-local-setup-test.ps1 -Install
+```
+
+This starts with `installed: false`, no current version and no working resources.
+Click the existing **Install** button to run `setup_app` with the local setup.
+MirrorChyan installation and updating use the same inline log and result area
+in the application card, without opening a separate console page.
+The default mode starts installed at
+`v0.0.1` for testing upgrades. Both modes use separate test directories.
+
+The script first runs a Tauri debug NSIS build, embedding the frontend in the
+launcher. A `tauri dev` build can overwrite the same debug EXE with a launcher
+that connects to `devUrl`, so the script rebuilds before each test and requires
+no running development server. It then uses that launcher and full NSIS template to
+prepare a separate `src-tauri/target/local-setup-test-<id>/dev_cwd` directory and
+test setup. It gives the setup its own Windows application registration. In the
+opened launcher, use the existing **Upgrade** button to update to `v0.0.2`.
+The expected changes are a confirmed `v0.0.2` version, a new resource marker at
+`data/apps/local-setup-sample/working/setup-test-version.txt`, and a refreshed
+profile pointing to `new_main.py`. The launcher PID, launcher EXE checksum and
+`settings.local.txt` must remain unchanged. This small fixture exercises updating;
+it does not include a runnable Python environment.
+
+Use `-SetupPath 'D:\path\your-new-setup.exe' -Version v1.2.3` to select another
+complete setup instead. That setup must retain the integration and application
+layout expected by the launcher. `-Automatic` runs an automatic startup update,
+verifies the result, writes `test-report.json`, and closes only its test launcher.
+It cannot be combined with `-Install`, which requires the manual installation UI.
+Without that switch the launcher remains open for manual testing.
+
+The script sets `PYAPPIFY_LOCAL_INSTALLER` and
+`PYAPPIFY_LOCAL_INSTALLER_VERSION` only for the child debug launcher, so its
+initial version lookup is also local. These overrides are ignored in release
+builds.
+
+### Build checks and full upgrade acceptance
+
 Run `cargo test --manifest-path src-tauri/Cargo.toml --lib`, `pnpm build`, and
 `pnpm exec tauri build --debug --bundles nsis --ci` (or the normal release build).
 Tests use loopback HTTP fixtures, in-memory DPAPI encryption, and isolated

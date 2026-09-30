@@ -177,6 +177,10 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
 }
 
 pub async fn latest(app: &crate::app::App) -> Result<Release> {
+    #[cfg(debug_assertions)]
+    if let Some((_, release)) = local_installer_release()? {
+        return Ok(release);
+    }
     let config = app
         .mirrorchyan
         .as_ref()
@@ -287,6 +291,22 @@ pub fn newer(release: &Release, current: Option<&str>) -> bool {
 }
 
 pub async fn download(app: &crate::app::App, target: &str, dir: &Path) -> Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some((source, release)) = local_installer_release()? {
+        if release.version_name != target {
+            bail!("The local test version changed. Check for updates again.");
+        }
+        validate_pe(&source)?;
+        let total = tokio::fs::metadata(&source).await?.len();
+        progress(&app.name, "downloading", 0, Some(total));
+        let partial = dir.join("setup.downloading");
+        tokio::fs::copy(&source, &partial).await?;
+        validate_pe(&partial)?;
+        let setup = dir.join("setup.exe");
+        tokio::fs::rename(partial, &setup).await?;
+        progress(&app.name, "downloaded", total, Some(total));
+        return Ok(setup);
+    }
     for attempt in 0..2 {
         let release = latest(app).await?;
         if release.version_name != target {
@@ -317,6 +337,34 @@ pub async fn download(app: &crate::app::App, target: &str, dir: &Path) -> Result
         return receive_installer(&app.name, response, release.sha256, dir).await;
     }
     bail!("Installer download URL expired; retry the update")
+}
+
+/// Debug builds can replace only the release lookup and download, leaving the
+/// normal launcher UI, application stopping, helper and receipt handling intact.
+#[cfg(debug_assertions)]
+fn local_installer_release() -> Result<Option<(PathBuf, Release)>> {
+    let Some(path) = std::env::var_os("PYAPPIFY_LOCAL_INSTALLER") else {
+        return Ok(None);
+    };
+    let version = std::env::var("PYAPPIFY_LOCAL_INSTALLER_VERSION")
+        .context("Set PYAPPIFY_LOCAL_INSTALLER_VERSION for the local setup test")?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() || !path.is_file() {
+        bail!("PYAPPIFY_LOCAL_INSTALLER must be the absolute path of a local setup EXE");
+    }
+    if crate::git::compare_version_tags(&version, &version).is_none() {
+        bail!("PYAPPIFY_LOCAL_INSTALLER_VERSION must be a supported version such as v0.0.2");
+    }
+    let release = Release {
+        version_name: version,
+        url: None,
+        release_note: format!(
+            "Local installer test: {}. No MirrorChyan request or download is performed.",
+            path.display()
+        ),
+        sha256: None,
+    };
+    Ok(Some((path, release)))
 }
 
 async fn receive_installer(

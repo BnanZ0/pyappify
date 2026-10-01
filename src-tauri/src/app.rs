@@ -36,6 +36,12 @@ pub enum AppUpdateState {
 pub struct App {
     pub name: String,
     #[serde(default)]
+    pub mirrorchyan: Option<crate::mirrorchyan::MirrorConfig>,
+    #[serde(default)]
+    pub update_source: crate::mirrorchyan::UpdateSource,
+    #[serde(default)]
+    pub update_phase: Option<String>,
+    #[serde(default)]
     pub icon: String,
     #[serde(default)]
     pub website: Option<String>,
@@ -248,6 +254,9 @@ pub fn update_app_from_yml(app: &mut App, file_path_str: &str) {
 
     app.icon = parsed_app.icon;
     app.website = parsed_app.website;
+    if parsed_app.mirrorchyan.is_some() {
+        app.mirrorchyan = parsed_app.mirrorchyan;
+    }
     app.profiles = parsed_app.profiles;
 
     if app.get_profile(&app.current_profile).is_none() {

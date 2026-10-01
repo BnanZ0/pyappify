@@ -6,6 +6,45 @@ use std::{thread, time::Duration};
 use tracing::{debug, info};
 use walkdir::WalkDir;
 
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", rand::random::<u64>()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        if unsafe {
+            MoveFileExW(
+                wide(&temp).as_ptr(),
+                wide(path).as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.into());
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
 const COPY_RETRY_ATTEMPTS: usize = 12;
 const COPY_RETRY_DELAY: Duration = Duration::from_millis(250);
 

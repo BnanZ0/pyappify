@@ -135,18 +135,18 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                                 {t('{{actionType}} progress', {actionType: progressAction ?? t('Upgrade')})}
                             </Typography>
                             <Typography variant="body2" color="text.secondary">
-                                {progress.value}%
+                                {!progress.indeterminate && `${progress.value}%`}
                             </Typography>
                         </Box>
                         <LinearProgress
-                            variant="determinate"
+                            variant={progress.indeterminate ? 'indeterminate' : 'determinate'}
                             value={progress.value}
                             color={progress.phase === 'failed' ? 'error' : progress.phase === 'complete' ? 'success' : 'primary'}
                             sx={{height: 9, borderRadius: 999}}
                         />
                         <Box sx={{display: 'flex', justifyContent: 'space-between', gap: 2, mt: 0.75}}>
                             <Typography variant="caption" color="text.secondary">
-                                {progressPhaseLabels[progress.phase]}
+                                {progress.phaseLabel ?? progressPhaseLabels[progress.phase]}
                             </Typography>
                             {progress.requirementsValue !== null && (
                                 <Typography variant="caption" color="text.secondary">

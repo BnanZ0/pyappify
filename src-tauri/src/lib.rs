@@ -5,6 +5,7 @@ mod config_manager;
 mod emitter;
 mod execute_python;
 mod git;
+mod mirrorchyan;
 mod python_env;
 mod runas;
 mod submodule;
@@ -287,6 +288,9 @@ async fn execute_update_request(options: &CommandLineOptions) -> Result<String, 
     let app = load_app()
         .await
         .map_err(|error| format!("Failed to load app: {error}"))?;
+    if app.update_source == mirrorchyan::UpdateSource::Mirrorchyan {
+        return Err("Use the launcher window for MirrorChyan updates; this CLI command only performs Git updates.".into());
+    }
     stop_app(app.name.clone())
         .await
         .map_err(|error| format!("Failed to stop {} before updating: {error}", app.name))?;
@@ -696,6 +700,8 @@ pub async fn run() {
                 update_config_item,
                 save_configuration,
                 get_config_payload,
+                mirrorchyan::mirrorchyan_has_cdk,
+                mirrorchyan::mirrorchyan_set_cdk,
                 add_defender_exclusion,
                 send_notification_cmd,
             ])

@@ -5,6 +5,7 @@ use crate::app::{
 };
 use crate::emitter::get_app_handle;
 use crate::git::ensure_repository;
+use crate::mirrorchyan::{self, UpdateSource};
 use crate::runas;
 use crate::utils::error::Error;
 use crate::utils::file;
@@ -298,6 +299,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
             let current_profile = app_from_disk.current_profile.clone();
             app_from_disk.icon = app_template.icon.clone();
             app_from_disk.profiles = app_template.profiles.clone();
+            app_from_disk.mirrorchyan = app_template.mirrorchyan.clone();
             app_from_disk.current_profile = current_profile;
             app_from_disk
         }
@@ -324,7 +326,8 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         Err(e) => return Err(e),
     };
 
-    if app.installed && !check_python_env_exists(app_name) {
+    if app.update_source == UpdateSource::Git && app.installed && !check_python_env_exists(app_name)
+    {
         warn!(
             "Python venv for app '{}' is missing. Deleting app artifacts and marking as not installed.",
             app_name
@@ -345,7 +348,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         app.name
     );
     let repo_path = path::get_app_repo_path(&app.name);
-    if app.installed && !repo_path.exists() {
+    if app.update_source == UpdateSource::Git && app.installed && !repo_path.exists() {
         warn!(
             "Repository for app '{}' is missing. Marking as not installed.",
             app_name
@@ -353,7 +356,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         app.installed = false;
     }
 
-    if app.installed {
+    if app.installed && app.update_source == UpdateSource::Git {
         rollback_interrupted_pip_sync_on_startup(&mut app, &repo_path).await?;
     }
 
@@ -426,6 +429,16 @@ pub async fn load_app() -> Result<App, Error> {
     }
 
     let mut auto_start_guard = AUTO_START_CHECKED.lock().await;
+    if get_app()
+        .await
+        .is_some_and(|a| a.update_source == UpdateSource::Mirrorchyan)
+    {
+        if !*auto_start_guard {
+            *auto_start_guard = true;
+            tokio::spawn(mirror_startup());
+        }
+        return get_app().await.ok_or_else(|| err!("App is not loaded."));
+    }
     if !*auto_start_guard {
         *auto_start_guard = true;
 
@@ -630,6 +643,55 @@ pub async fn load_app() -> Result<App, Error> {
 
 async fn update_app_from_disk() -> Result<bool, Error> {
     let mut app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        if app.update_state == AppUpdateState::Updating {
+            return Ok(false);
+        }
+        match mirrorchyan::latest(&app).await {
+            Ok(release) => {
+                app.available_versions = if app.update_state == AppUpdateState::Failed
+                    || mirrorchyan::newer(&release, app.current_version.as_deref())
+                {
+                    vec![release.version_name]
+                } else {
+                    vec![]
+                };
+                app.update_note = if release.release_note.is_empty() {
+                    vec![]
+                } else {
+                    vec![release.release_note]
+                };
+                if app.update_state == AppUpdateState::Idle {
+                    app.update_error = None;
+                }
+            }
+            Err(error) => {
+                app.available_versions.clear();
+                app.update_error = Some(error.to_string());
+            }
+        }
+        // Do not overwrite a concurrent installation or a source switch.
+        let mut guard = APP.lock().await;
+        if let Some(current) = guard.as_mut().filter(|a| {
+            a.update_source == UpdateSource::Mirrorchyan
+                && a.update_state != AppUpdateState::Updating
+                && a.update_method == app.update_method
+                && a.mirrorchyan == app.mirrorchyan
+        }) {
+            current.available_versions = app.available_versions;
+            current.update_note = app.update_note;
+            current.update_error = app.update_error;
+            save_app_config_to_json(current).await?;
+        }
+        return Ok(true);
+    }
+    // Git refreshes persist the entire snapshot. Keep process-only startup
+    // overrides from get_app() out of both app.json and the stored APP state.
+    let mut app = APP
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| err!("App is not loaded."))?;
     let original_app = app.clone();
 
     info!(
@@ -694,10 +756,43 @@ pub async fn update_app_preferences(
     app_name: String,
     update_method: Option<String>,
     auto_start: Option<bool>,
+    update_source: Option<UpdateSource>,
 ) -> Result<(), Error> {
     let app_dir_lock = get_app_lock(&app_name).await?;
     let _guard = app_dir_lock.lock().await;
     let mut app = get_app_by_name(&app_name).await?;
+    if let Some(source) = update_source {
+        if app.update_state == AppUpdateState::Updating {
+            return Err(err!("Wait for the current update to finish"));
+        }
+        if source == UpdateSource::Mirrorchyan && app.mirrorchyan.is_none() {
+            return Err(err!("MirrorChyan is not configured for this application"));
+        }
+        if source != app.update_source {
+            if source == UpdateSource::Git && app.installed {
+                // Git-installed applications already have this repository. A
+                // ZIP installation may not, so restore that original Git
+                // invariant before committing the source switch.
+                ensure_repository(&app).await?;
+                let repo_path = path::get_app_repo_path(&app.name);
+                let previous_known_version = app.current_version.clone();
+                let (versions, current) =
+                    git::get_tags_and_current_version(&app.name, repo_path).await?;
+                let (current_version, current_version_missing) =
+                    resolve_current_version_state(previous_known_version, &versions, current);
+                app.available_versions = versions;
+                app.current_version = current_version;
+                app.current_version_missing = current_version_missing;
+            } else {
+                app.available_versions.clear();
+            }
+            app.update_source = source;
+            app.update_state = AppUpdateState::Idle;
+            app.update_target_version = None;
+            app.update_error = None;
+            app.update_phase = None;
+        }
+    }
 
     if let Some(update_method) = update_method {
         if !matches!(
@@ -710,6 +805,11 @@ pub async fn update_app_preferences(
         }
         STARTUP_OVERRIDES.lock().await.update_method = None;
         app.update_method = update_method;
+        if app.update_method == UPDATE_METHOD_OPTION_MANUAL
+            && app.update_phase.as_deref() == Some("waiting")
+        {
+            app.update_phase = None;
+        }
     }
 
     if let Some(auto_start) = auto_start {
@@ -737,6 +837,13 @@ pub async fn get_update_notes(app_name: String, version: String) -> Result<Vec<S
     let app_lock = get_app_lock(&app_name).await?;
     let _guard = app_lock.lock().await;
     let app = get_app_by_name(&app_name).await?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        let release = mirrorchyan::latest(&app).await?;
+        if release.version_name != version {
+            return Err(err!("Only the latest MirrorChyan release is available"));
+        }
+        return Ok(vec![release.release_note]);
+    }
     let messages =
         git::get_commit_messages_for_version_diff(&app.get_repo_path(), &version).await?;
     info!(
@@ -751,6 +858,11 @@ pub async fn get_version_list(
     release_only: bool,
 ) -> Result<Vec<git::VersionHistoryEntry>, Error> {
     let app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        return Err(err!(
+            "Git version history is unavailable while MirrorChyan is selected"
+        ));
+    }
     let app_lock = get_app_lock(&app.name).await?;
     let _guard = app_lock.lock().await;
     ensure_repository(&app).await?;
@@ -965,6 +1077,10 @@ pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> 
     let repo_path = path::get_app_repo_path(app_name);
     let app = get_app_by_name(app_name).await?;
 
+    if app.update_source == UpdateSource::Mirrorchyan {
+        return Err(err!("MirrorChyan ZIP installation is not connected yet"));
+    }
+
     ensure_repository(&app).await?;
     ensure_app_operation_not_cancelled()?;
 
@@ -1134,6 +1250,11 @@ pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Erro
         .map_err(|_| err!("Another application operation is in progress"))?;
     let _cancellation_guard = AppOperationCancellationGuard::start();
 
+    let app = get_app_by_name(app_name).await?;
+    if app.update_source == UpdateSource::Mirrorchyan {
+        return Err(err!("MirrorChyan ZIP installation is not connected yet"));
+    }
+
     ensure_app_stopped_for_update(app_name).await?;
 
     if let Err(state_error) = persist_update_state(
@@ -1217,6 +1338,30 @@ pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Erro
             );
             emit_error_finish!(app_name);
             Err(error)
+        }
+    }
+}
+
+async fn mirror_startup() {
+    let Some(app) = get_app().await else {
+        return;
+    };
+    if app.auto_start && app.installed && app.update_state == AppUpdateState::Idle {
+        AUTO_START_CANCELLED.store(false, AtomicOrdering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if AUTO_START_CANCELLED.load(AtomicOrdering::SeqCst) {
+            return;
+        }
+        if let Some(current) = get_app().await {
+            if current.auto_start
+                && current.update_state == AppUpdateState::Idle
+                && current.update_source == UpdateSource::Mirrorchyan
+                && ensure_app_stopped_for_update(&current.name).await.is_ok()
+            {
+                if let Some(handle) = get_app_handle() {
+                    let _ = start_app(handle.clone(), current.name).await;
+                }
+            }
         }
     }
 }

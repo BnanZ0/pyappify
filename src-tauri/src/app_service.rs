@@ -1366,6 +1366,91 @@ async fn mirror_startup() {
     }
 }
 
+// The caller supplies replacement paths after validation and staging.
+async fn release_zip_file_locks(
+    app_name: &str,
+    replacement_paths: Vec<PathBuf>,
+    incremental: bool,
+    automatic: bool,
+) -> Result<Option<crate::restart_manager::Session>, Error> {
+    let app = get_app_by_name(app_name).await?;
+    let app_base = get_app_base_path(app_name);
+    let mut executables = vec![
+        path::get_python_exe(app_name, false),
+        path::get_python_exe(app_name, true),
+    ];
+    for profile in &app.profiles {
+        if profile.main_script.to_ascii_lowercase().ends_with(".exe") {
+            executables.push(get_app_working_dir_path(app_name).join(&profile.main_script));
+        }
+    }
+    let app_name = app_name.to_string();
+    task::spawn_blocking(move || -> Result<Option<crate::restart_manager::Session>> {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let processes = process::get_pids_related_to_app_dir(&system, &app_base);
+        if !processes.is_empty() {
+            if automatic {
+                return Ok(None);
+            }
+            bail!("The application is still running. Stop it completely and retry.");
+        }
+        let files = crate::restart_manager::existing_files(
+            &replacement_paths,
+            incremental,
+            app_operation_cancelled,
+        )?;
+        emit_info!(
+            &app_name,
+            "Checking file occupancy with Restart Manager ({} files).",
+            files.len()
+        );
+        let mut session = crate::restart_manager::Session::new(
+            &files,
+            &[],
+            &executables,
+            app_operation_cancelled,
+        )?;
+        let normalize = |value: &Path| {
+            value
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_lowercase()
+        };
+        let app_prefix = normalize(&app_base) + "/";
+        let affected = session.affected_processes()?;
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        for pid in affected {
+            if system
+                .process(Pid::from_u32(pid))
+                .and_then(|value| value.exe())
+                .is_some_and(|image| normalize(image).starts_with(&app_prefix))
+            {
+                if automatic {
+                    return Ok(None);
+                }
+                bail!(
+                    "The application is still running (PID {pid}). Stop it completely and retry."
+                );
+            }
+        }
+        if let Err(error) = session.shutdown(false, app_operation_cancelled) {
+            if let Err(restart_error) = session.restart() {
+                emit_info!(
+                    &app_name,
+                    "Some other applications could not be restarted: {restart_error:#}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(Some(session))
+    })
+    .await?
+    .map_err(Into::into)
+}
+
 async fn ensure_app_stopped_for_update(app_name: &str) -> Result<(), Error> {
     let app_base_path = get_app_base_path(app_name);
     let running_pids = task::spawn_blocking(move || {
@@ -2074,7 +2159,9 @@ pub async fn cancel_app_operation(app_name: String) -> Result<(), Error> {
         app_name
     );
     APP_OPERATION_CANCELLED.store(true, AtomicOrdering::SeqCst);
-    kill_app_processes(&app_name).await?;
+    if get_app_by_name(&app_name).await?.update_source != UpdateSource::Mirrorchyan {
+        kill_app_processes(&app_name).await?;
+    }
     emit_info!(&app_name, "Cancelling the current operation...");
     Ok(())
 }

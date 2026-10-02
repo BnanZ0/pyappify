@@ -7,6 +7,7 @@ mod execute_python;
 mod git;
 mod mirrorchyan;
 mod python_env;
+mod restart_manager;
 mod runas;
 mod submodule;
 mod utils;

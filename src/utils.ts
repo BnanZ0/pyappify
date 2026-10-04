@@ -14,6 +14,9 @@ export async function invokeTauriCommandWrapper<T>(
             await successResult;
         }
     } catch (err) {
+        if (typeof err === 'object' && err !== null && 'kind' in err && err.kind === 'cancelled') {
+            return; // The backend emits a normal cancelled completion after recovery.
+        }
         const errorMessage = (typeof err === 'object' && err !== null && 'message' in err) ? String((err as {
             message: unknown
         }).message) : String(err);

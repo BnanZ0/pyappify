@@ -22,6 +22,8 @@ struct MessagePayload<'a> {
     finished: bool,
     #[serde(default)]
     error: bool,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 pub fn get_app_handle() -> Option<&'static AppHandle<Wry>> {
@@ -74,6 +76,7 @@ pub(crate) fn emit_log_impl(
             update: final_is_update,
             finished: false,
             error: is_error,
+            cancelled: false,
         },
     );
 
@@ -97,10 +100,25 @@ pub(crate) fn emit_finish_impl(app_name: String, is_error: bool) {
             update: false,
             finished: true,
             error: is_error,
+            cancelled: false,
         },
     );
     let status = if is_error { "FAILED" } else { "COMPLETED" };
     println!("FINISHED [{}]: Process {}.", app_name, status);
+}
+
+pub(crate) fn emit_cancelled_finish(app_name: &str) {
+    emit(
+        "app-log",
+        MessagePayload {
+            app_name: app_name.into(),
+            message: "Operation cancelled",
+            update: false,
+            finished: true,
+            error: false,
+            cancelled: true,
+        },
+    );
 }
 
 #[macro_export]

@@ -66,7 +66,6 @@ interface App {
     name: string;
     update_source: 'git' | 'mirrorchyan';
     mirrorchyan: {resource_id: string; prerelease_channel?: string | null} | null;
-    update_phase: string | null;
     icon: string;
     website: string | null;
     path: string;
@@ -74,6 +73,7 @@ interface App {
     available_versions: string[];
     running: boolean;
     installed: boolean;
+    installation?: {source: 'git' | 'mirrorchyan'; version: string | null} | null;
     update_method: string;
     auto_start: boolean;
     update_state: 'idle' | 'updating' | 'failed';
@@ -97,12 +97,12 @@ type ParsedVersion = {
 const mirrorPhaseLabel = (phase: string): string => ({
     downloading: 'Downloading update...',
     downloaded: 'Update downloaded and verified.',
-    stopping: 'Stopping the application...',
+    extracting: 'Extracting update...',
     installing: 'Installing application...',
     completed: 'Installation completed.',
-    waiting: 'Waiting for the application to stop...',
     download_failed: 'Update download failed.',
     install_failed: 'Installation failed.',
+    cancelled: 'Operation cancelled.',
 } as Record<string, string>)[phase] ?? 'Preparing installation...';
 
 const parseVersion = (version: string): ParsedVersion | null => {
@@ -462,7 +462,20 @@ function App() {
         );
     };
 
+    const ensureMirrorCdk = async (): Promise<boolean> => {
+        if (app?.update_source !== 'mirrorchyan') return true;
+        try {
+            if (await invoke<boolean>('mirrorchyan_has_cdk')) return true;
+        } catch {
+            // An unreadable saved key is configured again in the same settings flow.
+        }
+        setCurrentPage('settings');
+        updateStatus({info: t('Configure a MirrorChyan CDK in Settings before installing or updating.'), error: null});
+        return false;
+    };
+
     const handleInstallWithProfile = async (appName: string, profileName: string) => {
+        if (!app?.installed && !await ensureMirrorCdk()) return;
         clearMessages();
         activeUpdateAppsRef.current.delete(appName);
         completedAppsRef.current.delete(appName);
@@ -630,8 +643,9 @@ function App() {
             message: string;
             finished?: boolean;
             error?: boolean;
+            cancelled?: boolean;
         }>("app-log", (event) => {
-            const {app_name, finished, error} = event.payload;
+            const {app_name, finished, error, cancelled} = event.payload;
             addConsoleLog(event.payload);
             const isUpdateEvent = activeUpdateAppsRef.current.has(app_name);
             if (isUpdateEvent) {
@@ -639,7 +653,12 @@ function App() {
                     const entry = prev[app_name];
                     if (!entry || entry.completed) return prev;
                     if (finished) {
-                        if (error) {
+                        if (cancelled) {
+                            completedAppsRef.current.delete(app_name);
+                            const next = {...prev};
+                            delete next[app_name];
+                            return next;
+                        } else if (error) {
                             completedAppsRef.current.delete(app_name); // failed — not completed
                             return {...prev, [app_name]: {...entry, isConfirming: false, failed: true}};
                         } else {
@@ -663,6 +682,9 @@ function App() {
                 setIsRunningAppConsoleOpen(false);
                 setIsProfileChangeProcessRunning(false);
             }
+        }));
+        unlistenPromises.push(listen<string>('mirrorchyan-cdk-required', () => {
+            updateStatus({info: t('Configure a MirrorChyan CDK in Settings to enable automatic updates.')});
         }));
 
         (async () => {
@@ -750,6 +772,7 @@ function App() {
     };
 
     const handleConfirmVersionChange = async (params: { appName: string, version: string, actionType: VersionActionType }) => {
+        if (!await ensureMirrorCdk()) return;
         clearMessages();
         activeUpdateAppsRef.current.add(params.appName);
         setAppActionLoading(prev => ({...prev, [params.appName]: true}));
@@ -963,7 +986,14 @@ function App() {
             appName={startingAppName}
             logs={consoleLogs[startingAppName] ?? []}
             onBack={handleBackFromConsole}
-            onCancel={!isMirrorInstall ? () => handleCancelAppOperation(startingAppName) : undefined}
+            onCancel={() => handleCancelAppOperation(startingAppName)}
+            progress={isMirrorInstall ? {
+                value: mirrorUpdateProgress[startingAppName]?.phase === 'completed' ? 100 : 0,
+                phase: app.update_state === 'failed' ? 'failed' : mirrorUpdateProgress[startingAppName]?.phase === 'completed' ? 'complete' : 'preparing',
+                requirementsValue: null,
+                indeterminate: app.update_state === 'updating',
+                phaseLabel: t(mirrorPhaseLabel(mirrorUpdateProgress[startingAppName]?.phase ?? 'preparing')),
+            } : undefined}
             isProcessing={isInstallProcessRunning}
         />;
     } else if (currentPage === 'runningAppConsole' && startingAppName) {
@@ -1055,7 +1085,7 @@ function App() {
                 )}
                 {app && (
                     (() => {
-                            const isEffectivelyInstalling = app.running && !app.installed;
+                            const isEffectivelyInstalling = app.running && !app.installed && !app.installation;
                             const isThisAppLoading = appActionLoading[app.name] || false;
                             const updateBlocksActions = app.update_state !== 'idle';
                             const persistedActionType = getVersionActionType(
@@ -1069,10 +1099,11 @@ function App() {
                             const inlineUpdateEntry = inlineUpdateLogs[app.name];
                             const inlineUpdateAction = inlineUpdateEntry?.actionType ?? persistedActionType;
                             const mirrorProgress = mirrorUpdateProgress[app.name];
-                            const mirrorPhase = mirrorProgress?.phase ?? app.update_phase ?? 'preparing';
+                            const mirrorPhase = mirrorProgress?.phase ?? 'preparing';
                             const mirrorFinishedLog = [...(consoleLogs[app.name] ?? [])].reverse().find(log => log.finished);
                             const mirrorFailed = app.update_state === 'failed' || mirrorPhase.endsWith('_failed') || !!mirrorFinishedLog?.error;
-                            const mirrorCompleted = !mirrorFailed && (mirrorPhase === 'completed' || !!mirrorFinishedLog);
+                            const mirrorCompleted = !mirrorFailed && mirrorPhase !== 'cancelled' && !mirrorFinishedLog?.cancelled
+                                && (mirrorPhase === 'completed' || !!mirrorFinishedLog);
                             const mirrorDownloadKnown = mirrorPhase === 'downloading' && !!mirrorProgress?.total;
                             const inlineConsoleProgress = inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
                                 ? calculateVersionChangeProgress(
@@ -1155,6 +1186,11 @@ function App() {
                                                             <Chip size="small" color="error" label={t(app.update_source === 'mirrorchyan' ? 'Installation failed.' : `${persistedActionType} failed`)}/>
                                                         )}
                                                     </Stack>
+                                                    {!app.installed && app.installation && (
+                                                        <Typography variant="body2" color="text.secondary" sx={{mt: 1}}>
+                                                            {t('selectedSourceNotInstalled')}
+                                                        </Typography>
+                                                    )}
                                                 </Box>
                                             </Stack>
                                             <Stack
@@ -1263,7 +1299,7 @@ function App() {
                                                         appName={app.name}
                                                         logs={consoleLogs[app.name] ?? []}
                                                         onBack={() => handleCloseInlineConsole(app.name)}
-                                                        onCancel={inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
+                                                        onCancel={inlineConsoleKind === 'update'
                                                             ? () => handleCancelAppOperation(app.name)
                                                             : undefined}
                                                         isProcessing={inlineConsoleKind === 'start'
@@ -1277,7 +1313,7 @@ function App() {
                                                                     ? Math.min(100, Math.round(mirrorProgress.downloaded / mirrorProgress.total! * 100)) : 0,
                                                                 phase: mirrorFailed ? 'failed' : mirrorCompleted ? 'complete' : 'preparing',
                                                                 requirementsValue: null,
-                                                                indeterminate: !mirrorFailed && !mirrorCompleted && !mirrorDownloadKnown,
+                                                                indeterminate: !mirrorFailed && !mirrorCompleted && !mirrorDownloadKnown && mirrorPhase !== 'cancelled',
                                                                 phaseLabel: t(mirrorPhaseLabel(mirrorFailed ? 'install_failed' : mirrorCompleted ? 'completed' : mirrorPhase)),
                                                             } : inlineConsoleProgress}
                                                         progressAction={inlineConsoleKind === 'update'

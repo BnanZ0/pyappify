@@ -1,67 +1,95 @@
-# MirrorChyan ZIP 更新准备
+# MirrorChyan 冻结包更新
 
-此分支从 `upstream/master`（`52bc6d9`）开始，按功能重新整理现有 master 的实现。
-原 NSIS 实验完整保留在 master 的 `da0a87d`，可随时查阅。
+Mirror 路线仅安装、更新和启动 PyInstaller `onedir` 应用包。
+原有 Git/setup/pip 路线继续使用原来的仓库、Python 和依赖流程。
+设置中可选择更新源。同一目录内切源时先检查应用已停止，仍运行则提示用户先停止；随后改名备份 working，使用正式目录安装和提交。
+当前选择的源与已提交安装分别保存；选择未安装的源时显示未安装，切回原源即可使用旧版。
+失败、取消或中断通过恢复日志还原旧安装；新路线成功后才清理旧程序。
 
-## 当前已整理
+## 配置与界面
 
-1. 安装、Git/pip 更新与环境配置的取消操作，沿用原 `6fb2840`，并保留 master 中恢复安装控制台的取消入口。
-2. MirrorChyan CDK 保存、更新源切换、最新版本/更新说明查询和更新 UI。
-
-第二项直接取自现有 master 的实现：
-
-- Windows DPAPI 加密 CDK，原子替换保存文件；不把 CDK 写入应用配置。
-- 保留原安装路径对应的 `%LOCALAPPDATA%/PyAppify/updates/<路径摘要>/cdk.bin`，可读取原已保存的 CDK。
-- 最新版本查询优先带 Windows 平台和架构；错误 8001 时回退到无平台标记的资源。
-- 保留稳定/测试频道选择、空更新说明处理与不回显 CDK 的错误提示。
-- 查询返回时检查更新源、配置和操作状态，避免旧结果覆盖正在进行的更新。
-- 保留 Git 刷新时不持久化一次性启动参数的修复。
-- MirrorChyan 安装不要求 Git 仓库；切回 Git 时先恢复原有仓库条件。
-- 保留延迟启动前对取消请求、更新源、更新状态与应用运行情况的检查。
-- 更新进度事件改为 `mirror-update-progress`；前端显示下载字节进度和未知进度阶段。
-
-## 本提交的边界
-
-ZIP 下载、增量应用和自动更新尚未接入。选择 MirrorChyan 后调用安装/更新会明确返回
-`MirrorChyan ZIP installation is not connected yet`，不会执行 Git/pip 更新。
-自动启动入口已保留，MirrorChyan 自动更新将在 ZIP 实现时接回。
-
-没有引入旧 setup 下载器、安装 helper、安装结果回执、本地 NSIS 打包实验、依赖检查/卸载脚本。
-上游自带的基础 NSIS 打包配置保持原样；此处分离的是 MirrorChyan 的 setup 更新链路。
-
-Restart Manager 的旧实现仅在 NSIS 脚本中，目前没有独立的第三个提交。
-ZIP 接入后若仍需要处理外部进程的文件占用，应针对变更/删除文件使用它，
-避免扫描或注册整个 lib 目录，也需保护正在运行的启动器。
-
-## 配置入口
-
-应用的 `pyappify.yml` 可配置：
+应用的 `pyappify.yml` 配置示例：
 
 ```yaml
 mirrorchyan:
   resource_id: YOUR_RESOURCE_ID
   stable_channel: stable
-  # 资源提供测试版时才启用：
+  packaging: packaging  # 构建目录, 内含唯一 .spec 和 requirements-build.txt/requirements.txt
+  # 资源提供测试版时才配置：
   # prerelease_channel: beta
 ```
 
-更新源由设置页面选择，默认仍为 `git`。CDK 在设置页面保存或清除。
-此框架仓库没有写入 ok-nte 的资源 ID 或应用专属配置。
+Git 是通用启动器的默认安装方式；冻结包中的 YAML 标记为 `mirrorchyan`。
+CDK 在现有设置页保存或清除，使用 Windows 当前账户加密，保存在安装目录外。
+查版本不要求 CDK，下载时要求有效 CDK。错误输出不包含带 CDK 的请求地址。
+完整包解压后即可启动，不要求 CDK 或网络。手动下载前先检查 CDK；无 Key 时引导到设置。
+自动更新缺少 Key 时跳过下载并提示配置，保留用户原有更新偏好。
+Mirror 继续使用原有安装、更新、版本说明、取消及自动启动界面。
+阶段和下载字节通过 `mirror-update-progress` 事件显示，不逐阶段写入 `app.json`。
 
-## 后续 ZIP 路线
+## 安装与更新
 
-- 同一资源 ID 分发完整应用 ZIP 与增量 ZIP，不再把 setup 作为 Mirro 更新负载。
-- Mirro 可为已记录的任意旧版本到最新版生成直接增量，不限于上一版。
-- 某版本组合的补丁未生成时，当前请求可能返回完整包并触发后台生成；客户端必须处理完整包回退。
-- 增量包 `changes.json` 的路径相对包根目录，字段包括 `added`、`modified`、`deleted`、
-  `added_dir`、`deleted_dir`，没有变更的类别可能省略。
-- 未变化的 lib 不应读写；核心目标是依赖不变时更新在几秒内完成。
-- Git/pip 安装或修改过的目录不能仅凭应用版本号认定为准确的 ZIP 增量基线。
-- 尽量保持启动器运行，并保留更新、自动启动和用户偏好状态。
+1. 根据有效基线请求完整包或增量包，下载时计算整包 SHA-256；服务端提供校验值时核对。
+2. 校验包身份、版本、入口、路径及 `changes.json`，在安装盘暂存解压。
+   ZIP 解压检查 CRC；路径拒绝穿越、大小写别名、Windows 保留名、链接及 junction。
+3. 下载前检查应用已停止，暂存完成后再次检查。Windows Restart Manager 检查替换文件的占用；
+   发现应用运行则拒绝更新。其他程序的占用沿用既有 RM 检查及恢复流程。
+   手动与自动更新使用同一策略；保护主启动器，不自动停止应用、不提权重试、不轮询等待。
+4. 获得成功会话后执行文件事务。完整包替换 `working`，清除旧应用及旧库文件；
+   增量只应用服务端列出的新增、修改、删除和目录变化，不扫描或写入未变化的库。
+5. 负载、包元数据、版本配置与基线在同一事务内提交。
+   失败或取消回滚已完成动作；启动时先恢复未提交事务，再读取 `app.json`。
+6. 成功后后台清理已提交备份，无法清理的文件留待下次启动重试。
 
-官方资料：[增量格式](https://github.com/MirrorChyan/docs/blob/main/Incremental.md)、
-[上传 Action](https://github.com/MirrorChyan/uploading-action/blob/v1/action.yml)。
-此前核对的后端版本是 `224169b563de488a7ea5fc21e49361be6e71f51d`，
-其中 [最新版本选择](https://github.com/MirrorChyan/resource-backend/blob/224169b563de488a7ea5fc21e49361be6e71f51d/internal/logic/nv.go)
-和 [补丁生成](https://github.com/MirrorChyan/resource-backend/blob/224169b563de488a7ea5fc21e49361be6e71f51d/internal/logic/version.go)
-可以作为后续实现参考。
+切源时旧 working 改名备份，安装器使用正式目录。Mirror → Git 创建新的 Python 和仓库，
+可能被修改的既有 Python/仓库也先改名备份；失败删除新目录，恢复备份和 Mirror 根元数据。
+Git → Mirror 保留旧 Python/仓库直到安装记录提交成功，之后清理旧程序。
+普通同源 Git 安装、更新与回滚沿用原作者流程。配置安装使用指定 profile 及原 `default` 回退；
+版本更新从新 YAML 的 `default` profile 读取依赖，依赖指定或内容变化时同步 pip。
+不复制 Python、不改写 pip 入口或 editable 路径。原 pip 失败 marker 继续处理同源依赖失败。
+
+Mirror 操作取消并成功回滚后状态回到 `idle`，清空重试目标，通过普通完成事件显示取消。
+取消只中断当前操作，不持久化屏蔽某个版本或改写更新偏好。Git/pip 的取消检查和进程清理保留用户原实现；
+通用命令执行器不读取安装取消标志，正常运行应用不受 Mirror 取消影响。
+更新失败保留 `failed` 和详情，并按原作者规则阻止启动及自动启动。Git 在启动时重试持久化的失败或中断目标；
+当前 Git 发布版本缺失时继续采用原强制更新规则。Mirror 失败由用户重试，本地事务在加载安装记录前恢复。
+已提交备份清理失败只提示，不撤销安装成功状态。
+   仅在清理已提交旧树时解除只读属性，运行中的用户缓存保持原属性。
+
+根目录启动器始终跳过：不暂存、备份、替换或删除，增量中的相关变更也被忽略。
+完整 ZIP 可以包含启动器，供首次手动解压使用。应用目录内的 EXE 正常更新。
+RM 的资源范围、进程保护和后续占用导致的回滚见 [Restart Manager](restart-manager.md)。
+
+## 用户数据与基线
+
+Git 的旧安装版本跟踪文件、Mirror 本体中的 `pyappify-files.json` 构成程序文件集合。
+旧程序路径被替换，其余用户新增文件自动迁移；新程序文件赢得同路径和文件/目录冲突。
+`_internal`、外部 Python 和仓库属于程序结构，不迁移旧库。程序资源不限于固定目录，
+个人 MIDI、收藏、配置以及任意自建目录中的文件均按这套规则处理。
+不使用维护列表、哈希、修改时间或扩展名，不保留对发布程序文件的用户修改。
+程序清单用于切源和 Mirror 文件迁移。普通 Git 同步恢复原复制与额外文件清理规则，
+不以 Git 跟踪文件集合替换旧同步工具。Mirror 增量删除目录时保留其中的用户文件。
+
+本体清单由 PyAppify 在完整干净构建后生成，包含 EXE、库和全部外置应用资源，
+相对本体根目录，无 launcher 包装前缀。先产生独立本体 ZIP，再复用它产生完整 Mirror ZIP。
+应用项目无需增加清单生成脚本或资源路径参数；已有 onedir 包装入口要求从未运行的干净构建。
+旧 Mirror 没有有效清单时，完整替换和切源明确拒绝并保留旧安装；可从同版本的干净完整发布包取得清单。
+不会扫描运行过的 working 伪造程序基线。旧版仍可离线启动。
+
+成功事务写入 `.mirrorchyan-baseline.json`，内容仅含包身份、版本、架构及必要布局。
+已安装版本、资源 ID、启动器名、架构、根包元数据、有效本体清单和必要运行文件匹配时才携带
+`current_version` 请求增量。入口或旧发布布局变化、无有效基线、失败重试均用完整包。
+增量的列出文件与本地状态不匹配时，重新请求一次完整包；不无限重试。
+基线不读取 requirements/pyproject、不计算 profile 依赖指纹、不扫描或散列库文件。
+因此不承诺发现手工修改过的、未被本次增量列出的文件。
+
+## 启动与本地工具
+
+启动器根据包元数据定位应用 EXE，以 `working` 为工作目录，传递已有版本、profile、
+语言等应用环境，并复用原日志、进程状态和自动启动机制。
+冻结包无需外部 Python 或 pip；profile 仅表示可用配置，不划分依赖组合。
+应用快捷方式直接指向应用 EXE，使用原有 EXE 快捷方式与权限设置。
+
+包布局、包装命令及启动权限限制见 [冻结包说明](mirrorchyan-frozen.md)。
+本地只保留 `mirror_frozen_pack` 和隔离校验/计时工具 `mirror_zip_bench`。
+构建与验证记录见 [删减后的验证记录](mirrorchyan-frozen-results.md)。

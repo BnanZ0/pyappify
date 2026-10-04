@@ -33,14 +33,20 @@ pub enum AppUpdateState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Installation {
+    pub source: crate::mirrorchyan::UpdateSource,
+    pub version: Option<String>,
+    pub current_profile: String,
+    pub profiles: Vec<Profile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct App {
     pub name: String,
     #[serde(default)]
     pub mirrorchyan: Option<crate::mirrorchyan::MirrorConfig>,
     #[serde(default)]
     pub update_source: crate::mirrorchyan::UpdateSource,
-    #[serde(default)]
-    pub update_phase: Option<String>,
     #[serde(default)]
     pub icon: String,
     #[serde(default)]
@@ -63,6 +69,9 @@ pub struct App {
     pub current_profile: String,
     #[serde(default)]
     pub installed: bool,
+    /// Committed payload; `installed` and `current_version` describe the selected source.
+    #[serde(default)]
+    pub installation: Option<Installation>,
     #[serde(default = "default_update_method_fn")]
     pub update_method: String,
     #[serde(default)]
@@ -84,6 +93,46 @@ fn default_last_start_fn() -> DateTime<Utc> {
 }
 
 impl App {
+    pub fn ready_to_start(&self) -> bool {
+        self.installed && self.update_state == AppUpdateState::Idle
+    }
+
+    pub fn remember_installation(&mut self) {
+        if self.installed {
+            self.installation = Some(Installation {
+                source: self.update_source,
+                version: self.current_version.clone(),
+                current_profile: self.current_profile.clone(),
+                profiles: self.profiles.clone(),
+            });
+        }
+    }
+
+    pub fn select_update_source(&mut self, source: crate::mirrorchyan::UpdateSource) {
+        self.remember_installation();
+        self.update_source = source;
+        self.project_installation();
+        self.available_versions.clear();
+        self.update_note.clear();
+        self.update_state = AppUpdateState::Idle;
+        self.update_target_version = None;
+        self.update_error = None;
+    }
+
+    pub fn project_installation(&mut self) {
+        self.installed = false;
+        self.current_version = None;
+        self.current_version_missing = false;
+        if let Some(installation) = &self.installation {
+            if installation.source == self.update_source {
+                self.installed = true;
+                self.current_version = installation.version.clone();
+                self.current_profile = installation.current_profile.clone();
+                self.profiles = installation.profiles.clone();
+            }
+        }
+    }
+
     pub fn get_repo_path(&self) -> PathBuf {
         path::get_app_repo_path(&self.name)
     }
@@ -436,6 +485,64 @@ pub(crate) async fn load_app_config_from_json(app_name: &str) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_selection_keeps_committed_installation_and_restores_it_after_reload() {
+        let mut app: super::App = serde_json::from_value(serde_json::json!({
+            "name": "sample", "installed": true, "current_version": "v1.4.6",
+            "current_profile": "China", "profiles": [{"name": "China", "main_script": "main.py"}],
+            "update_method": "AUTO_UPDATE"
+        }))
+        .unwrap();
+        app.select_update_source(crate::mirrorchyan::UpdateSource::Mirrorchyan);
+        assert!(!app.installed);
+        assert_eq!(app.current_version, None);
+        assert_eq!(
+            app.installation.as_ref().unwrap().version.as_deref(),
+            Some("v1.4.6")
+        );
+        app = serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
+        app.select_update_source(crate::mirrorchyan::UpdateSource::Git);
+        assert!(app.ready_to_start());
+        assert_eq!(app.current_version.as_deref(), Some("v1.4.6"));
+        assert_eq!(app.current_profile, "China");
+        assert_eq!(app.profiles[0].main_script, "main.py");
+        assert_eq!(app.update_method, "AUTO_UPDATE");
+    }
+
+    #[test]
+    fn failed_or_updating_or_uninstalled_application_cannot_start() {
+        let mut app: super::App =
+            serde_json::from_str(r#"{"name":"sample","installed":true,"update_state":"failed"}"#)
+                .unwrap();
+        assert!(!app.ready_to_start());
+        app.update_state = super::AppUpdateState::Updating;
+        assert!(!app.ready_to_start());
+        app.update_state = super::AppUpdateState::Idle;
+        assert!(app.ready_to_start());
+        app.installed = false;
+        assert!(!app.ready_to_start());
+    }
+
+    #[test]
+    fn successful_new_route_replaces_the_committed_installation() {
+        let mut app: super::App = serde_json::from_str(
+            r#"{"name":"sample","installed":true,"current_version":"v1.0.0"}"#,
+        )
+        .unwrap();
+        app.select_update_source(crate::mirrorchyan::UpdateSource::Mirrorchyan);
+        app.installed = true;
+        app.current_version = Some("v2.0.0".into());
+        app.remember_installation();
+        app.select_update_source(crate::mirrorchyan::UpdateSource::Git);
+        assert!(!app.installed);
+        assert_eq!(
+            app.installation.as_ref().unwrap().source,
+            crate::mirrorchyan::UpdateSource::Mirrorchyan
+        );
+        app.select_update_source(crate::mirrorchyan::UpdateSource::Mirrorchyan);
+        assert!(app.installed);
+        assert_eq!(app.current_version.as_deref(), Some("v2.0.0"));
+    }
     use super::{
         write_file_atomically, App, AppUpdateState, Profile, UPDATE_METHOD_OPTION_AUTO,
         UPDATE_METHOD_OPTION_MANUAL,
@@ -492,11 +599,13 @@ mod tests {
         let without_website: App = serde_yaml::from_str("name: example\n").unwrap();
         assert_eq!(without_website.website, None);
 
-        let with_website: App = serde_yaml::from_str(
-            "name: example\nwebsite: https://example.com/downloads\n",
-        )
-        .unwrap();
-        assert_eq!(with_website.website.as_deref(), Some("https://example.com/downloads"));
+        let with_website: App =
+            serde_yaml::from_str("name: example\nwebsite: https://example.com/downloads\n")
+                .unwrap();
+        assert_eq!(
+            with_website.website.as_deref(),
+            Some("https://example.com/downloads")
+        );
     }
 
     #[test]

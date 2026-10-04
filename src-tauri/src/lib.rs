@@ -5,7 +5,10 @@ mod config_manager;
 mod emitter;
 mod execute_python;
 mod git;
+mod mirror_package;
+mod mirror_zip;
 mod mirrorchyan;
+mod program_files;
 mod python_env;
 mod restart_manager;
 mod runas;
@@ -518,6 +521,13 @@ pub async fn run() {
                 .unwrap_or(1);
             eprintln!("{error:#}");
             std::process::exit(code);
+        }
+        return;
+    }
+    if let Some(result) = mirror_package::try_run(&command_line_args) {
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
         return;
     }

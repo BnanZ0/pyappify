@@ -4,6 +4,8 @@ use shortcuts_rs::MSLinkError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Operation cancelled by user")]
+    Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -26,6 +28,7 @@ pub enum Error {
 #[serde(tag = "kind", content = "message")]
 #[serde(rename_all = "camelCase")]
 enum ErrorKind {
+    Cancelled(String),
     Io(String),
     Regex(String),
     Utf8(String),
@@ -43,6 +46,7 @@ impl serde::Serialize for Error {
     {
         let error_message = self.to_string();
         let error_kind = match self {
+            Self::Cancelled => ErrorKind::Cancelled(error_message),
             Self::Io(_) => ErrorKind::Io(error_message),
             Self::Regex(_) => ErrorKind::Regex(error_message),
             Self::Utf8(_) => ErrorKind::Utf8(error_message),

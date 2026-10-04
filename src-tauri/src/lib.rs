@@ -472,9 +472,55 @@ async fn show_main_window(window: tauri::Window) {
     window.set_focus().unwrap();
 }
 
+fn close_installation_files(args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.len() == 2,
+        "Expected installation directory and installer path"
+    );
+    let directory = PathBuf::from(&args[0]);
+    anyhow::ensure!(
+        directory.is_absolute(),
+        "The installation directory must be absolute"
+    );
+    let installer = PathBuf::from(&args[1]);
+    let mut files = restart_manager::existing_files(&[directory], true, || false)?;
+    files.retain(|file| {
+        let native = file
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "exe" | "dll" | "pyd")
+            });
+        native
+            && !file
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&installer.to_string_lossy())
+    });
+    let mut session = restart_manager::Session::new(&files, &[], &[installer], || false)?;
+    // Preserve the installer policy: graceful shutdown, then RM's force fallback.
+    session
+        .shutdown(false, || false)
+        .or_else(|_| session.shutdown(true, || false))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub async fn run() {
     let command_line_args = env::args().collect::<Vec<_>>();
+    if command_line_args
+        .get(1)
+        .is_some_and(|value| value == "--installer-restart-manager")
+    {
+        let result = close_installation_files(&command_line_args[2..]);
+        if let Err(error) = result {
+            let code = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|error| error.raw_os_error())
+                .unwrap_or(1);
+            eprintln!("{error:#}");
+            std::process::exit(code);
+        }
+        return;
+    }
     let command_line_options = match parse_command_line(&command_line_args) {
         Ok(options) => options,
         Err(error) => {

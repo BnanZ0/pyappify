@@ -23,3 +23,14 @@ Windows 实现位于 `src-tauri/src/restart_manager.rs`。`existing_files` 按�
 RM 成功不保证之后的文件替换成功，调用方仍负责处理失败与回滚。
 
 既有原生窗口与资源范围测试随接口调整保留。本次未执行回归测试。
+
+## NSIS 接入
+
+`installer.nsi` 将包内启动器释放到 `$PLUGINSDIR/restart-manager.exe`，通过
+`--installer-restart-manager <安装目录> <安装器路径>` 调用相同的 Rust 公共模块。
+该命令在 GUI、单实例及配置初始化之前执行。
+
+安装器递归登记现存 `.exe`、`.dll`、`.pyd`，排除并保护安装器自身；沿用
+`test-setup-1` 的正常关闭后强制关闭后备策略，不请求重新启动已关闭程序。
+错误码返回 NSIS，交互安装保留重试，静默安装返回失败。
+

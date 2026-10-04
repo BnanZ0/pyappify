@@ -9,7 +9,9 @@ import {openUrl} from '@tauri-apps/plugin-opener';
 import UpdateLogPage from "./UpdateLogPage";
 import ConsolePage, {type MessagePayload} from "./ConsolePage.tsx";
 import SettingsPage from "./SettingsPage.tsx";
-import {calculateVersionChangeProgress, type VersionActionType} from "./updateProgress";
+import {type VersionActionType} from "./updateProgress";
+import {GitInstallConsole, GitUpdateConsole} from './GitOperationConsole';
+import MirrorOperationConsole, {mirrorPhaseLabel} from './MirrorOperationConsole';
 
 import {
     Alert,
@@ -66,7 +68,6 @@ interface App {
     name: string;
     update_source: 'git' | 'mirrorchyan';
     mirrorchyan: {resource_id: string; prerelease_channel?: string | null} | null;
-    update_phase: string | null;
     icon: string;
     website: string | null;
     path: string;
@@ -74,6 +75,7 @@ interface App {
     available_versions: string[];
     running: boolean;
     installed: boolean;
+    installation?: {source: 'git' | 'mirrorchyan'; version: string | null} | null;
     update_method: string;
     auto_start: boolean;
     update_state: 'idle' | 'updating' | 'failed';
@@ -93,17 +95,6 @@ type ParsedVersion = {
         number: number | null;
     };
 };
-
-const mirrorPhaseLabel = (phase: string): string => ({
-    downloading: 'Downloading update...',
-    downloaded: 'Update downloaded and verified.',
-    stopping: 'Stopping the application...',
-    installing: 'Installing application...',
-    completed: 'Installation completed.',
-    waiting: 'Waiting for the application to stop...',
-    download_failed: 'Update download failed.',
-    install_failed: 'Installation failed.',
-} as Record<string, string>)[phase] ?? 'Preparing installation...';
 
 const parseVersion = (version: string): ParsedVersion | null => {
     const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:(?:-|\.)(alpha|beta|rc)(?:\.(\d+))?)?$/);
@@ -196,7 +187,7 @@ type InlineUpdateLogState = {
     failed?: boolean;
 };
 
-type InlineConsoleKind = 'start' | 'update';
+type InlineConsoleKind = 'start' | 'git-update' | 'mirror';
 
 const MAX_CONSOLE_LOGS = 500;
 const CONSOLE_LOG_STORAGE_KEY = 'pyappifyConsoleLogs';
@@ -278,8 +269,12 @@ function App() {
     // Updated synchronously so the app event listener sees it before React re-renders.
     const completedAppsRef = useRef<Set<string>>(new Set());
     const appUpdateStatesRef = useRef<Record<string, App['update_state']>>({});
-    const activeUpdateAppsRef = useRef<Set<string>>(new Set());
-    const [isInstallProcessRunning, setIsInstallProcessRunning] = useState<boolean>(false);
+    const appSourcesRef = useRef<Record<string, App['update_source']>>({});
+    const activeGitUpdateAppsRef = useRef<Set<string>>(new Set());
+    const gitInstallAppsRef = useRef<Set<string>>(new Set());
+    const activeMirrorAppsRef = useRef<Set<string>>(new Set());
+    const [isMirrorProcessRunning, setIsMirrorProcessRunning] = useState(false);
+    const [isGitInstallProcessRunning, setIsGitInstallProcessRunning] = useState<boolean>(false);
     const [isStartAppProcessRunning, setIsStartAppProcessRunning] = useState<boolean>(false);
     const [startingAppName, setStartingAppName] = useState<string | null>(null);
     const [consoleLogs, setConsoleLogs] = useState<Record<string, MessagePayload[]>>(loadConsoleLogs);
@@ -462,9 +457,20 @@ function App() {
         );
     };
 
-    const handleInstallWithProfile = async (appName: string, profileName: string) => {
+    const ensureMirrorCdk = async (): Promise<boolean> => {
+        try {
+            if (await invoke<boolean>('mirrorchyan_has_cdk')) return true;
+        } catch {
+            // An unreadable saved key is configured again in the same settings flow.
+        }
+        setCurrentPage('settings');
+        updateStatus({info: t('Configure a MirrorChyan CDK in Settings before installing or updating.'), error: null});
+        return false;
+    };
+
+    const handleGitInstallWithProfile = async (appName: string, profileName: string) => {
         clearMessages();
-        activeUpdateAppsRef.current.delete(appName);
+        activeGitUpdateAppsRef.current.delete(appName);
         completedAppsRef.current.delete(appName);
         setInlineConsoles(prev => {
             const next = {...prev};
@@ -476,33 +482,64 @@ function App() {
             delete next[appName];
             return next;
         });
-        delete mirrorUpdateProgressRef.current[appName];
-        setMirrorUpdateProgress(prev => ({...prev, [appName]: {phase: 'preparing', downloaded: 0, total: null}}));
         setAppActionLoading(prev => ({...prev, [appName]: true}));
         setStartingAppName(appName);
-        beginConsoleSession(appName, app?.update_source === 'mirrorchyan'
-            ? t('Installing App: {{appName}}', {appName})
-            : `Initiating install for '${appName}' with profile '${profileName}'...`);
-        setIsInstallProcessRunning(true);
-        if (app?.update_source === 'mirrorchyan') {
-            activeUpdateAppsRef.current.add(appName);
-            setInlineConsoles(prev => ({...prev, [appName]: 'update'}));
-            setCurrentPage('list');
-        } else {
-            setCurrentPage('installConsole');
-        }
+        beginConsoleSession(appName, `Initiating install for '${appName}' with profile '${profileName}'...`);
+        gitInstallAppsRef.current.add(appName);
+        setIsGitInstallProcessRunning(true);
+        setCurrentPage('installConsole');
 
         await invokeTauriCommandWrapper<void>("setup_app", {appName, profileName}, () => {},
             (errorMessage, rawError) => {
                 console.error(`Failed to invoke setup_app for ${appName} with profile ${profileName}:`, rawError);
                 addConsoleLog({message: `ERROR: Failed to install app: ${errorMessage}`, app_name: appName, error: true, finished: true});
-                setIsInstallProcessRunning(false);
+                gitInstallAppsRef.current.delete(appName);
+                setIsGitInstallProcessRunning(false);
+                setAppActionLoading(prev => ({...prev, [appName]: false}));
             }
         );
     };
 
+    const beginMirrorOperation = (appName: string) => {
+        clearMessages();
+        completedAppsRef.current.delete(appName);
+        activeMirrorAppsRef.current.add(appName);
+        delete mirrorUpdateProgressRef.current[appName];
+        setMirrorUpdateProgress(prev => ({...prev, [appName]: {phase: 'preparing', downloaded: 0, total: null}}));
+        setAppActionLoading(prev => ({...prev, [appName]: true}));
+        beginConsoleSession(appName, t('Installing App: {{appName}}', {appName}));
+        setIsMirrorProcessRunning(true);
+        setInlineConsoles(prev => ({...prev, [appName]: 'mirror'}));
+        setCurrentPage('list');
+    };
+
+    const finishMirrorInvocationError = (appName: string, errorMessage: string) => {
+        activeMirrorAppsRef.current.delete(appName);
+        setIsMirrorProcessRunning(false);
+        setAppActionLoading(prev => ({...prev, [appName]: false}));
+        addConsoleLog({message: errorMessage, app_name: appName, error: true, finished: true});
+    };
+
+    const handleMirrorInstall = async (mirrorApp: App) => {
+        if (!mirrorApp.installed && !await ensureMirrorCdk()) return;
+        setInlineUpdateLogs(prev => {
+            const next = {...prev};
+            delete next[mirrorApp.name];
+            return next;
+        });
+        beginMirrorOperation(mirrorApp.name);
+        await invokeTauriCommandWrapper<void>('setup_app', {
+            appName: mirrorApp.name,
+            profileName: mirrorApp.current_profile || mirrorApp.profiles?.[0]?.name || 'default',
+        }, () => {}, errorMessage => finishMirrorInvocationError(mirrorApp.name, errorMessage));
+    };
+
     const handleInstallClick = (app: App) => {
-        if (app.update_source !== 'mirrorchyan' && app.profiles && app.profiles.length > 1) {
+        if (app.update_source === 'mirrorchyan') {
+            void handleMirrorInstall(app);
+            return;
+        }
+        if (app.profiles && app.profiles.length > 1) {
             setProfileChoiceApp(app);
             const initialProfile = app.profiles.some(p => p.name === app.current_profile)
                 ? app.current_profile
@@ -511,7 +548,7 @@ function App() {
             setCurrentPage('profileChooser');
         } else {
             const profileName = app.current_profile || app.profiles?.[0]?.name || "default";
-            handleInstallWithProfile(app.name, profileName);
+            void handleGitInstallWithProfile(app.name, profileName);
         }
     };
 
@@ -538,16 +575,47 @@ function App() {
 
         unlistenPromises.push(listen<App>("app", (event) => {
             const app = event.payload;
+            const previousSource = appSourcesRef.current[app.name];
+            if (previousSource && previousSource !== app.update_source) {
+                activeGitUpdateAppsRef.current.delete(app.name);
+                activeMirrorAppsRef.current.delete(app.name);
+                gitInstallAppsRef.current.delete(app.name);
+                completedAppsRef.current.delete(app.name);
+                setIsGitInstallProcessRunning(false);
+                setIsMirrorProcessRunning(false);
+                setInlineConsoles(prev => {
+                    const next = {...prev};
+                    delete next[app.name];
+                    return next;
+                });
+                setInlineUpdateLogs(prev => {
+                    const next = {...prev};
+                    delete next[app.name];
+                    return next;
+                });
+            }
+            appSourcesRef.current[app.name] = app.update_source;
             const previousUpdateState = appUpdateStatesRef.current[app.name];
             if (app.update_state === 'updating' && previousUpdateState !== 'updating') {
-                activeUpdateAppsRef.current.add(app.name);
-                setInlineConsoles(prev => ({...prev, [app.name]: 'update'}));
                 if (app.update_source === 'mirrorchyan') {
+                    activeMirrorAppsRef.current.add(app.name);
+                    setInlineConsoles(prev => ({...prev, [app.name]: 'mirror'}));
                     setMirrorUpdateProgress(prev => ({...prev, [app.name]: {phase: 'preparing', downloaded: 0, total: null}}));
-                    setStartingAppName(app.name);
-                    setIsInstallProcessRunning(true);
+                    setIsMirrorProcessRunning(true);
+                    ensureActiveConsoleSession(app.name, t('Installing App: {{appName}}', {appName: app.name}));
+                } else if (!app.installed) {
+                    // Installing the selected Git source is not a Git version update.
+                    gitInstallAppsRef.current.add(app.name);
+                    setIsGitInstallProcessRunning(true);
+                    setInlineConsoles(prev => {
+                        const next = {...prev};
+                        delete next[app.name];
+                        return next;
+                    });
                     ensureActiveConsoleSession(app.name, t('Installing App: {{appName}}', {appName: app.name}));
                 } else {
+                    activeGitUpdateAppsRef.current.add(app.name);
+                    setInlineConsoles(prev => ({...prev, [app.name]: 'git-update'}));
                     const actionType = getVersionActionType(
                         app.update_target_version ?? '',
                         app.current_version,
@@ -630,16 +698,22 @@ function App() {
             message: string;
             finished?: boolean;
             error?: boolean;
+            cancelled?: boolean;
         }>("app-log", (event) => {
-            const {app_name, finished, error} = event.payload;
+            const {app_name, finished, error, cancelled} = event.payload;
             addConsoleLog(event.payload);
-            const isUpdateEvent = activeUpdateAppsRef.current.has(app_name);
-            if (isUpdateEvent) {
+            const isGitUpdateEvent = activeGitUpdateAppsRef.current.has(app_name);
+            if (isGitUpdateEvent) {
                 setInlineUpdateLogs(prev => {
                     const entry = prev[app_name];
                     if (!entry || entry.completed) return prev;
                     if (finished) {
-                        if (error) {
+                        if (cancelled) {
+                            completedAppsRef.current.delete(app_name);
+                            const next = {...prev};
+                            delete next[app_name];
+                            return next;
+                        } else if (error) {
                             completedAppsRef.current.delete(app_name); // failed — not completed
                             return {...prev, [app_name]: {...entry, isConfirming: false, failed: true}};
                         } else {
@@ -654,15 +728,37 @@ function App() {
                 if (finished && !error) {
                     setSelectedTargetVersions(prev => ({...prev, [app_name]: ''}));
                 }
-                if (finished) activeUpdateAppsRef.current.delete(app_name);
+                if (finished) activeGitUpdateAppsRef.current.delete(app_name);
             }
             if (finished) {
+                if (gitInstallAppsRef.current.delete(app_name)) setIsGitInstallProcessRunning(false);
+                if (activeMirrorAppsRef.current.delete(app_name)) {
+                    setIsMirrorProcessRunning(false);
+                    setInlineUpdateLogs(prev => {
+                        const entry = prev[app_name];
+                        if (!entry) return prev;
+                        if (cancelled) {
+                            const next = {...prev};
+                            delete next[app_name];
+                            return next;
+                        }
+                        return {...prev, [app_name]: {...entry,
+                            isConfirming: false, failed: !!error, completed: !error,
+                        }};
+                    });
+                    if (!error) {
+                        completedAppsRef.current.add(app_name);
+                        setSelectedTargetVersions(prev => ({...prev, [app_name]: ''}));
+                    }
+                }
                 setAppActionLoading(prev => ({...prev, [app_name]: false}));
-                setIsInstallProcessRunning(false);
                 setIsStartAppProcessRunning(false);
                 setIsRunningAppConsoleOpen(false);
                 setIsProfileChangeProcessRunning(false);
             }
+        }));
+        unlistenPromises.push(listen<string>('mirrorchyan-cdk-required', () => {
+            updateStatus({info: t('Configure a MirrorChyan CDK in Settings to enable automatic updates.')});
         }));
 
         (async () => {
@@ -749,9 +845,9 @@ function App() {
         setInlineUpdateLogs(prev => ({...prev, [appName]: {version: targetVersion, actionType, isConfirming: false}}));
     };
 
-    const handleConfirmVersionChange = async (params: { appName: string, version: string, actionType: VersionActionType }) => {
+    const handleGitVersionChange = async (params: { appName: string, version: string, actionType: VersionActionType }) => {
         clearMessages();
-        activeUpdateAppsRef.current.add(params.appName);
+        activeGitUpdateAppsRef.current.add(params.appName);
         setAppActionLoading(prev => ({...prev, [params.appName]: true}));
         // Mark as confirming so the inline log shows a spinner
         setInlineUpdateLogs(prev => ({
@@ -759,15 +855,8 @@ function App() {
             [params.appName]: {...(prev[params.appName] ?? {version: params.version, actionType: params.actionType}), isConfirming: true, completed: false, failed: false}
         }));
         setStartingAppName(params.appName);
-        beginConsoleSession(params.appName, app?.update_source === 'mirrorchyan'
-            ? t('Installing App: {{appName}}', {appName: params.appName})
-            : `Initiating ${params.actionType} for '${params.appName}' to version '${params.version}'...`);
-        if (app?.update_source === 'mirrorchyan') {
-            delete mirrorUpdateProgressRef.current[params.appName];
-            setMirrorUpdateProgress(prev => ({...prev, [params.appName]: {phase: 'preparing', downloaded: 0, total: null}}));
-            setIsInstallProcessRunning(true);
-        }
-        setInlineConsoles(prev => ({...prev, [params.appName]: 'update'}));
+        beginConsoleSession(params.appName, `Initiating ${params.actionType} for '${params.appName}' to version '${params.version}'...`);
+        setInlineConsoles(prev => ({...prev, [params.appName]: 'git-update'}));
 
         const requirementsFile = app?.profiles?.find(p => p.name === app.current_profile)?.requirements || "requirements.txt";
 
@@ -775,9 +864,6 @@ function App() {
             (errorMessage, rawError) => {
                 console.error(`Failed to invoke ${params.actionType.toLowerCase()}:`, rawError);
                 const operationError = `Upgrade failed: ${errorMessage}`;
-                if (app?.update_source === 'mirrorchyan') {
-                    setIsInstallProcessRunning(false);
-                }
                 completedAppsRef.current.delete(params.appName);
                 setInlineUpdateLogs(prev => {
                     const entry = prev[params.appName];
@@ -789,10 +875,41 @@ function App() {
         );
     };
 
+    const handleMirrorVersionChange = async (params: {appName: string; version: string; actionType: VersionActionType}) => {
+        if (!await ensureMirrorCdk()) return;
+        setInlineUpdateLogs(prev => ({...prev, [params.appName]: {
+            version: params.version, actionType: params.actionType, isConfirming: true,
+        }}));
+        beginMirrorOperation(params.appName);
+        await invokeTauriCommandWrapper<void>('update_to_version', {
+            appName: params.appName, version: params.version,
+        }, () => {}, errorMessage => {
+            setInlineUpdateLogs(prev => ({...prev, [params.appName]: {
+                version: params.version, actionType: params.actionType, isConfirming: false, failed: true,
+            }}));
+            finishMirrorInvocationError(params.appName, errorMessage);
+        });
+    };
+
+    const handleOpenGitInstallConsole = (appName: string) => {
+        clearMessages();
+        setStartingAppName(appName);
+        setConsoleLogs(previous => previous[appName]?.length ? previous : {
+            ...previous,
+            [appName]: [{
+                app_name: appName,
+                message: app?.update_error ?? t('Installing App: {{appName}}', {appName}),
+                error: app?.update_state === 'failed',
+                finished: app?.update_state === 'failed',
+            }],
+        });
+        setCurrentPage('installConsole');
+    };
+
     const handleOpenRunningAppConsole = (appName: string) => {
         clearMessages();
         setStartingAppName(appName);
-        const consoleTitle = (app?.running && !app.installed) ? `Installation console for: ${appName}` : `Console for running app: ${appName}`;
+        const consoleTitle = `Console for running app: ${appName}`;
         setConsoleLogs(previous => previous[appName]?.length
             ? previous
             : {...previous, [appName]: [{message: consoleTitle, app_name: appName}]});
@@ -800,7 +917,7 @@ function App() {
         setCurrentPage('runningAppConsole');
     };
 
-    const handleOpenUpdateConsole = (appName: string) => {
+    const handleOpenGitUpdateConsole = (appName: string) => {
         const entry = inlineUpdateLogs[appName];
         const version = app?.update_target_version ?? entry?.version;
         if (!version) return;
@@ -817,15 +934,15 @@ function App() {
                     finished: app?.update_state === 'failed',
                 }],
             });
-        if (app?.update_source === 'mirrorchyan') {
-            setIsInstallProcessRunning(app.update_state === 'updating');
-        }
-        setInlineConsoles(prev => ({...prev, [appName]: 'update'}));
+        setInlineConsoles(prev => ({...prev, [appName]: 'git-update'}));
     };
 
-    const handleCloseInlineConsole = async (appName: string) => {
-        if (app?.update_source === 'mirrorchyan' && app.update_state !== 'updating') {
-            setIsInstallProcessRunning(false);
+    const handleOpenMirrorConsole = (appName: string) => {
+        setInlineConsoles(prev => ({...prev, [appName]: 'mirror'}));
+    };
+
+    const handleCloseMirrorConsole = async (appName: string) => {
+        if (!activeMirrorAppsRef.current.has(appName) && app?.update_state !== 'updating') {
             setInlineUpdateLogs(prev => {
                 const next = {...prev};
                 delete next[appName];
@@ -833,6 +950,10 @@ function App() {
             });
             setSelectedTargetVersions(prev => ({...prev, [appName]: ''}));
         }
+        await handleCloseInlineConsole(appName);
+    };
+
+    const handleCloseInlineConsole = async (appName: string) => {
         setInlineConsoles(prev => {
             const next = {...prev};
             delete next[appName];
@@ -852,7 +973,7 @@ function App() {
     };
 
     const resetConsoleStates = () => {
-        setIsInstallProcessRunning(false);
+        if (!gitInstallAppsRef.current.size) setIsGitInstallProcessRunning(false);
         setIsStartAppProcessRunning(false);
         setIsRunningAppConsoleOpen(false);
         setIsProfileChangeProcessRunning(false);
@@ -957,23 +1078,19 @@ function App() {
     let pageContent;
 
     if (currentPage === 'installConsole' && startingAppName) {
-        const isMirrorInstall = app?.name === startingAppName && app.update_source === 'mirrorchyan';
-        pageContent = <ConsolePage
-            title={t('Installing App: {{appName}}', {appName: startingAppName})}
+        pageContent = <GitInstallConsole
             appName={startingAppName}
             logs={consoleLogs[startingAppName] ?? []}
             onBack={handleBackFromConsole}
-            onCancel={!isMirrorInstall ? () => handleCancelAppOperation(startingAppName) : undefined}
-            isProcessing={isInstallProcessRunning}
+            onCancel={() => handleCancelAppOperation(startingAppName)}
+            isProcessing={isGitInstallProcessRunning}
         />;
     } else if (currentPage === 'runningAppConsole' && startingAppName) {
-        const isResumedInstallation = app?.name === startingAppName && app.running && !app.installed;
         pageContent = <ConsolePage
             title={t('Console: {{appName}}', {appName: startingAppName})}
             appName={startingAppName}
             logs={consoleLogs[startingAppName] ?? []}
             onBack={handleBackFromConsole}
-            onCancel={isResumedInstallation ? () => handleCancelAppOperation(startingAppName) : undefined}
             isProcessing={isRunningAppConsoleOpen}
         />;
     } else if (currentPage === 'profileChangeConsole' && profileChangeData && startingAppName) {
@@ -994,7 +1111,7 @@ function App() {
                         </FormControl>
                         <Stack direction="row" spacing={2} sx={{mt: 3, justifyContent: 'flex-end'}}>
                             <Button variant="outlined" onClick={() => setCurrentPage('list')}>{t('Cancel')}</Button>
-                            <Button variant="contained" onClick={() => handleInstallWithProfile(profileChoiceApp.name, selectedProfileForInstall)} disabled={!selectedProfileForInstall || appActionLoading[profileChoiceApp.name]}>
+                            <Button variant="contained" onClick={() => handleGitInstallWithProfile(profileChoiceApp.name, selectedProfileForInstall)} disabled={!selectedProfileForInstall || appActionLoading[profileChoiceApp.name]}>
                                 {appActionLoading[profileChoiceApp.name] ? t("Starting Install...") : t("Confirm & Install")}
                             </Button>
                         </Stack>
@@ -1055,7 +1172,12 @@ function App() {
                 )}
                 {app && (
                     (() => {
-                            const isEffectivelyInstalling = app.running && !app.installed;
+                            const isGitInstalling = app.update_source === 'git' && !app.installed
+                                && (app.running || isGitInstallProcessRunning || app.update_state === 'updating');
+                            const hasMirrorOperation = app.update_source === 'mirrorchyan'
+                                && (isMirrorProcessRunning || app.update_state !== 'idle');
+                            const hasGitInstallFailure = app.update_source === 'git' && !app.installed
+                                && app.update_state === 'failed';
                             const isThisAppLoading = appActionLoading[app.name] || false;
                             const updateBlocksActions = app.update_state !== 'idle';
                             const persistedActionType = getVersionActionType(
@@ -1064,22 +1186,11 @@ function App() {
                                 'Upgrade',
                             );
                             const disableRowActions = currentPage !== 'list' || status.messageLoading || isThisAppLoading || updateBlocksActions;
-                            const disableUpdateControls = currentPage !== 'list' || status.messageLoading || isThisAppLoading || app.update_state === 'updating';
+                            const disableUpdateControls = currentPage !== 'list' || status.messageLoading || isThisAppLoading
+                                || isMirrorProcessRunning || isGitInstallProcessRunning || app.update_state === 'updating';
                             const inlineConsoleKind = inlineConsoles[app.name];
                             const inlineUpdateEntry = inlineUpdateLogs[app.name];
                             const inlineUpdateAction = inlineUpdateEntry?.actionType ?? persistedActionType;
-                            const mirrorProgress = mirrorUpdateProgress[app.name];
-                            const mirrorPhase = mirrorProgress?.phase ?? app.update_phase ?? 'preparing';
-                            const mirrorFinishedLog = [...(consoleLogs[app.name] ?? [])].reverse().find(log => log.finished);
-                            const mirrorFailed = app.update_state === 'failed' || mirrorPhase.endsWith('_failed') || !!mirrorFinishedLog?.error;
-                            const mirrorCompleted = !mirrorFailed && (mirrorPhase === 'completed' || !!mirrorFinishedLog);
-                            const mirrorDownloadKnown = mirrorPhase === 'downloading' && !!mirrorProgress?.total;
-                            const inlineConsoleProgress = inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
-                                ? calculateVersionChangeProgress(
-                                    consoleLogs[app.name] ?? [],
-                                    app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming,
-                                )
-                                : undefined;
                         return (
                                 <Card
                                     key={app.name}
@@ -1137,9 +1248,9 @@ function App() {
                                                     <Stack direction="row" spacing={0.75} useFlexGap sx={{mt: 0.75, flexWrap: 'wrap'}}>
                                                         <Chip
                                                             size="small"
-                                                            color={app.running ? 'success' : isEffectivelyInstalling ? 'info' : 'default'}
-                                                            variant={app.running || isEffectivelyInstalling ? 'filled' : 'outlined'}
-                                                            label={app.running && app.installed ? t('(Running)') : isEffectivelyInstalling ? t('(Installing...)') : app.installed ? t('Installed') : t('(Not Installed)')}
+                                                            color={isGitInstalling ? 'info' : app.running ? 'success' : 'default'}
+                                                            variant={app.running || isGitInstalling ? 'filled' : 'outlined'}
+                                                            label={app.running && app.installed ? t('(Running)') : isGitInstalling ? t('(Installing...)') : app.installed ? t('Installed') : t('(Not Installed)')}
                                                             sx={{fontWeight: 650}}
                                                         />
                                                         {app.installed && app.current_version && (
@@ -1148,13 +1259,18 @@ function App() {
                                                         {app.installed && app.current_profile && (
                                                             <Chip size="small" variant="outlined" label={app.current_profile}/>
                                                         )}
-                                                        {app.update_state === 'updating' && (
+                                                        {app.update_state === 'updating' && !isGitInstalling && (
                                                             <Chip size="small" color="info" icon={<CircularProgress size={14}/>} label={t(app.update_source === 'mirrorchyan' ? '(Installing...)' : getVersionActionProgressKey(persistedActionType))}/>
                                                         )}
                                                         {app.update_state === 'failed' && (
-                                                            <Chip size="small" color="error" label={t(app.update_source === 'mirrorchyan' ? 'Installation failed.' : `${persistedActionType} failed`)}/>
+                                                            <Chip size="small" color="error" label={t(app.update_source === 'mirrorchyan' || hasGitInstallFailure ? 'Installation failed.' : `${persistedActionType} failed`)}/>
                                                         )}
                                                     </Stack>
+                                                    {!app.installed && app.installation && !isGitInstalling && !hasMirrorOperation && (
+                                                        <Typography variant="body2" color="text.secondary" sx={{mt: 1}}>
+                                                            {t('selectedSourceNotInstalled')}
+                                                        </Typography>
+                                                    )}
                                                 </Box>
                                             </Stack>
                                             <Stack
@@ -1174,10 +1290,16 @@ function App() {
                                                             <Button variant="contained" color="success" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <PlayArrow/>} onClick={() => handleStartApp(app.name)} disabled={disableRowActions || !app.current_version}>{t("Start App")}</Button>
                                                         </>
                                                     )
-                                                ) : isEffectivelyInstalling ? (
-                                                    <Button variant="outlined" color="info" size="small" startIcon={<OpenInNew/>} onClick={() => handleOpenRunningAppConsole(app.name)} disabled={disableRowActions}>{t('Console')}</Button>
+                                                ) : isGitInstalling ? (
+                                                    <Button variant="outlined" color="info" size="small" startIcon={<OpenInNew/>} onClick={() => handleOpenGitInstallConsole(app.name)}>{t('Console')}</Button>
                                                 ) : (
                                                     <Button variant="contained" color="primary" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <Build/>} endIcon={<KeyboardArrowRight/>} onClick={() => handleInstallClick(app)} disabled={disableUpdateControls}>{t("Install")}</Button>
+                                                )}
+                                                {hasMirrorOperation && (
+                                                    <Button variant="outlined" color="info" size="small" startIcon={<OpenInNew/>} onClick={() => handleOpenMirrorConsole(app.name)}>{t('Console')}</Button>
+                                                )}
+                                                {hasGitInstallFailure && (
+                                                    <Button variant="outlined" color="info" size="small" startIcon={<OpenInNew/>} onClick={() => handleOpenGitInstallConsole(app.name)}>{t('Console')}</Button>
                                                 )}
                                                 {app.show_add_defender && !hiddenDefenderButtons.has(app.name) && <Button variant="outlined" color="secondary" size="small" startIcon={isThisAppLoading && addingDefenderExclusionForApp === app.name ? <CircularProgress size={16}/> : <Build/>} onClick={() => handleAddDefenderExclusion(app.name)} disabled={disableRowActions}>{t("Add Defender Exclusion")}</Button>}
                                                 {app.installed && !app.running && app.profiles?.length > 1 && <Button variant="outlined" color="secondary" size="small" startIcon={isThisAppLoading ? <CircularProgress size={16}/> : <Cached/>} onClick={() => handleNavigateToChangeProfilePage(app)} disabled={disableRowActions}>{t("Change Profile")}</Button>}
@@ -1252,36 +1374,33 @@ function App() {
                                                         <Tooltip title={t("Check for updates")}><span><IconButton onClick={() => handleCheckForUpdates(app.name)} disabled={app.update_source === 'mirrorchyan' ? disableUpdateControls : disableRowActions} sx={{bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2}}>{isThisAppLoading && checkingUpdateForApp === app.name ? <CircularProgress size={20}/> : <Cached fontSize="small"/>}</IconButton></span></Tooltip>
                                                     </Stack>
                                                 )}
-                                                {inlineConsoleKind ? (
+                                                {inlineConsoleKind === 'mirror' ? (
+                                                    <MirrorOperationConsole
+                                                        appName={app.name}
+                                                        logs={consoleLogs[app.name] ?? []}
+                                                        onBack={() => handleCloseMirrorConsole(app.name)}
+                                                        onCancel={() => handleCancelAppOperation(app.name)}
+                                                        isProcessing={isMirrorProcessRunning || app.update_state === 'updating'}
+                                                        failed={app.update_state === 'failed'}
+                                                        progress={mirrorUpdateProgress[app.name]}
+                                                    />
+                                                ) : inlineConsoleKind === 'git-update' ? (
+                                                    <GitUpdateConsole
+                                                        appName={app.name}
+                                                        actionType={inlineUpdateAction}
+                                                        logs={consoleLogs[app.name] ?? []}
+                                                        onBack={() => handleCloseInlineConsole(app.name)}
+                                                        onCancel={() => handleCancelAppOperation(app.name)}
+                                                        isProcessing={app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming}
+                                                    />
+                                                ) : inlineConsoleKind === 'start' ? (
                                                     <ConsolePage
                                                         inline
-                                                        title={inlineConsoleKind === 'start'
-                                                            ? t('Starting App: {{appName}}', {appName: app.name})
-                                                            : app.update_source === 'mirrorchyan'
-                                                                ? t('Installing App: {{appName}}', {appName: app.name})
-                                                                : t('{{actionType}} App: {{appName}}', {actionType: t(inlineUpdateAction), appName: app.name})}
+                                                        title={t('Starting App: {{appName}}', {appName: app.name})}
                                                         appName={app.name}
                                                         logs={consoleLogs[app.name] ?? []}
                                                         onBack={() => handleCloseInlineConsole(app.name)}
-                                                        onCancel={inlineConsoleKind === 'update' && app.update_source !== 'mirrorchyan'
-                                                            ? () => handleCancelAppOperation(app.name)
-                                                            : undefined}
-                                                        isProcessing={inlineConsoleKind === 'start'
-                                                            ? isStartAppProcessRunning && startingAppName === app.name
-                                                            : app.update_source === 'mirrorchyan'
-                                                                ? isInstallProcessRunning || app.update_state === 'updating'
-                                                                : app.update_state === 'updating' || !!inlineUpdateEntry?.isConfirming}
-                                                        progress={inlineConsoleKind === 'update' && app.update_source === 'mirrorchyan'
-                                                            ? {
-                                                                value: mirrorCompleted ? 100 : mirrorDownloadKnown
-                                                                    ? Math.min(100, Math.round(mirrorProgress.downloaded / mirrorProgress.total! * 100)) : 0,
-                                                                phase: mirrorFailed ? 'failed' : mirrorCompleted ? 'complete' : 'preparing',
-                                                                requirementsValue: null,
-                                                                indeterminate: !mirrorFailed && !mirrorCompleted && !mirrorDownloadKnown,
-                                                                phaseLabel: t(mirrorPhaseLabel(mirrorFailed ? 'install_failed' : mirrorCompleted ? 'completed' : mirrorPhase)),
-                                                            } : inlineConsoleProgress}
-                                                        progressAction={inlineConsoleKind === 'update'
-                                                            ? t(app.update_source === 'mirrorchyan' ? 'Install' : inlineUpdateAction) : undefined}
+                                                        isProcessing={isStartAppProcessRunning && startingAppName === app.name}
                                                     />
                                                 ) : inlineUpdateEntry && (
                                                     <UpdateLogPage
@@ -1292,8 +1411,8 @@ function App() {
                                                         completed={inlineUpdateEntry.completed}
                                                         failed={inlineUpdateEntry.failed}
                                                         website={app.website}
-                                                        onConfirm={handleConfirmVersionChange}
-                                                        onOpenConsole={() => handleOpenUpdateConsole(app.name)}
+                                                        onConfirm={app.update_source === 'mirrorchyan' ? handleMirrorVersionChange : handleGitVersionChange}
+                                                        onOpenConsole={() => app.update_source === 'mirrorchyan' ? handleOpenMirrorConsole(app.name) : handleOpenGitUpdateConsole(app.name)}
                                                         onCancel={() => {
                                                             completedAppsRef.current.delete(app.name);
                                                             setSelectedTargetVersions(p => ({...p, [app.name]: ''}));

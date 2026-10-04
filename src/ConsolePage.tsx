@@ -12,6 +12,7 @@ export type MessagePayload = {
     update?: boolean;
     finished?: boolean;
     error?: boolean;
+    cancelled?: boolean;
 };
 
 interface ConsolePageProps {
@@ -83,11 +84,12 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
 
     const displayMessage = internalIsProcessing
         ? t("Process in progress...")
+        : lastFinishedLog?.cancelled ? t('Operation cancelled.')
         : t("Process finished.{{errorText}} Review logs and click Done.", {errorText: processCompletedWithError ? t(" There were errors.") : ""});
 
     const alertSeverity = internalIsProcessing
         ? "info"
-        : (processCompletedWithError ? "error" : "success");
+        : (lastFinishedLog?.cancelled ? "info" : processCompletedWithError ? "error" : "success");
 
     const handleCancel = async () => {
         if (!onCancel || cancelPending) return;
@@ -128,7 +130,7 @@ const ConsolePage: React.FC<ConsolePageProps> = ({
                 <Alert severity={alertSeverity} icon={internalIsProcessing ? <CircularProgress size={20}/> : undefined}>
                     {displayMessage}
                 </Alert>
-                {progress && (
+                {progress && !lastFinishedLog?.cancelled && (
                     <Box sx={{mt: 1.5}}>
                         <Box sx={{display: 'flex', justifyContent: 'space-between', gap: 2, mb: 0.75}}>
                             <Typography variant="body2" sx={{fontWeight: 650}}>

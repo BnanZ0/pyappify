@@ -78,7 +78,11 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ app, currentTheme, onChange
             await operation();
             setCdk('');
             setHasCdk(await invoke<boolean>('mirrorchyan_has_cdk'));
-            await invoke('load_app');
+            // Source selection is local and must remain usable while versions load.
+            void invoke('load_app').catch((error) => {
+                const detail = typeof error === 'string' ? error : (error as {message?: string})?.message;
+                setMirrorError(detail || t('mirrorSettingsFailed'));
+            });
         } catch (error) {
             const detail = typeof error === 'string' ? error : (error as {message?: string})?.message;
             setMirrorError(detail || t('mirrorSettingsFailed'));

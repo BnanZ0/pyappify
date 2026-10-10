@@ -18,7 +18,7 @@ A modern Python packaging tool that turns one Python project into a distributabl
 This method distributes the lightweight `PyAppify` launcher. The launcher will then download your application and its dependencies on the user's machine.
 
 1.  Download the latest `pyappify` executable from the project's [Releases page](https://github.com/ok-oldking/pyappify/releases).
-2.  Modify the `pyappify.yml` file according to your python project.
+2.  Modify the root `pyappify.yml` for your Python project when using the Git launcher. Without it, the launcher uses its embedded configuration.
 
 ```yaml
 # pyappify.yml
@@ -44,13 +44,39 @@ installed without their dependencies.
 
 3. You can test the launcher by double-clicking the pyappify.exe and install python with the GUI. You can then package the files for offline or online distribution.
 
-* pyappify.yml (Required, You project config.)
+* pyappify.yml (Optional Git configuration override beside the launcher.)
 * pyappify.exe (You can rename it to your app name.)
 * data (python, venv, dependencies, git repo, include if you want the offline full package.)
 * logs(pyappify logs and your console log, auto rotate, can be deleted.)
-* cache(pip cache etc, can be deleted.)
+* cache (pip cache and MirrorChyan downloads under `cache/mirrorchyan/`, can be deleted.)
 
-For compatibility with existing installations, application state remains under `data/apps/<app-name>/`. Other directories already present under `data/apps/` are left untouched, but the launcher loads only the application embedded in its `pyappify.yml`.
+Application state is stored under `data/apps/<app-name>/`. Installed application configuration is read from `data/apps/<app-name>/working/pyappify.yml`, which defines the application name, profiles and optional MirrorChyan resource ID. The launcher uses its embedded configuration before installation. Git launchers also support a `pyappify.yml` override beside the launcher.
+
+Save a MirrorChyan CDK in Settings to install or update through MirrorChyan. It is stored in `data/config/mirrorchyan.bin`, encrypted with Windows DPAPI for the current Windows account. Moving the installation directory on the same account and computer preserves the saved CDK; deleting the entire directory removes it. Frozen body and full ZIPs do not include `data/config`.
+
+Frozen applications run without a Python virtual environment. Their `working/pyappify-files.json` manifest records the package format, version, file list and executable entry point. MirrorChyan uses the installed version to select a complete or incremental update ZIP; both update types must include this manifest.
+
+## Frozen ZIP packaging
+
+Set the packaging directory at the root of your application's `pyappify.yml`:
+
+```yaml
+packaging: packaging
+```
+
+The directory contains one PyInstaller `.spec`, `requirements-build.txt` (or `requirements.txt`), and optionally `build.ps1`. With Python and uv available, run:
+
+```text
+launcher.exe -c frozen-zip <app.yml> <version> <full.zip> [body.zip]
+```
+
+The command always generates the body ZIP and also generates the full ZIP when MirrorChyan is configured. `body.zip` contains the clean application body at its root; `full.zip` contains the launcher and the same body under `data/apps/<app-name>/working/`. If the body path is omitted, it is derived from the full path with a `-body.zip` suffix. Without MirrorChyan, the full path is not written.
+
+To generate a full ZIP with MirrorChyan updates, set `mirrorchyan.resource_id` in the application's YAML and use a launcher built for the same application name. The packaged YAML sets `update_source: mirrorchyan`.
+
+The body ZIP contains the application EXE, `_internal`, external resources, YAML and program manifest. Without MirrorChyan configuration, packaging preserves the application's YAML and generates only the body ZIP.
+
+In the GitHub Action, set `package_mode: frozen` or `all` to generate frozen packages. Outputs are available as `body-zip-path` and, when MirrorChyan is configured, `full-zip-path`. Use `use_release` to package with a prebuilt release launcher.
 
 
 ## Quick Start: Pre-packaged Release with GitHub Actions

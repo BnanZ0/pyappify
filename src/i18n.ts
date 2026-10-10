@@ -3,9 +3,12 @@ import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 
+import {mirrorChinese, mirrorEnglish, mirrorJapanese, mirrorKorean, mirrorSpanish, mirrorTraditional} from './features/mirror/translations';
+
 const resources = {
     en: {
         translation: {
+            ...mirrorEnglish,
             "appMadeWith": "App made with {{name}}",
             "appLauncherName": "{{appName}} Launcher",
             "Installed": "Installed",
@@ -128,6 +131,7 @@ const resources = {
     },
     'zh-CN': {
         translation: {
+            ...mirrorChinese,
             "Confirm Deletion": "确认删除",
             "appMadeWith": "使用 {{name}} 打包",
             "appLauncherName": "{{appName}} 启动器",
@@ -252,6 +256,7 @@ const resources = {
     },
     'zh-TW': {
         translation: {
+            ...mirrorTraditional,
             "Confirm Deletion": "確認刪除",
             "appMadeWith": "使用 {{name}} 打包",
             "appLauncherName": "{{appName}} 啟動器",
@@ -374,6 +379,7 @@ const resources = {
     },
     ja: {
         translation: {
+            ...mirrorJapanese,
             "Confirm Deletion": "削除の確認",
             "appMadeWith": "{{name}} で作られたアプリ",
             "appLauncherName": "{{appName}} ランチャー",
@@ -496,6 +502,7 @@ const resources = {
     },
     ko: {
         translation: {
+            ...mirrorKorean,
             "Confirm Deletion": "삭제 확인",
             "appMadeWith": "{{name}}(으)로 만든 앱",
             "appLauncherName": "{{appName}} 런처",
@@ -618,6 +625,7 @@ const resources = {
     },
     es: {
         translation: {
+            ...mirrorSpanish,
             "Confirm Deletion": "Confirmar Eliminación",
             "appMadeWith": "Aplicación hecha con {{name}}",
             "appLauncherName": "Lanzador de {{appName}}",

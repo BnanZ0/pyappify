@@ -14,6 +14,8 @@ export type VersionChangeProgress = {
     value: number;
     phase: VersionChangeProgressPhase;
     requirementsValue: number | null;
+    indeterminate?: boolean;
+    phaseLabel?: string;
 };
 
 type ProgressLog = {

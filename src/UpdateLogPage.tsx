@@ -1,5 +1,5 @@
 // src/UpdateLogPage.tsx
-import React, {useEffect, useRef, useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {invoke} from "@tauri-apps/api/core";
 import {Alert, Box, Button, CircularProgress, Link, Paper, Stack, Typography} from "@mui/material";
 import {openUrl} from '@tauri-apps/plugin-opener';
@@ -16,16 +16,10 @@ interface UpdateLogPanelProps {
     completed?: boolean;
     failed?: boolean;
     website?: string | null;
-    onConfirm: (params: { appName: string, version: string, actionType: VersionActionType }) => void;
+    onConfirm: (params: { appName: string, version: string, actionType: VersionActionType; notes?: string }) => void;
     onCancel: () => void;
     onOpenConsole: () => void;
 }
-
-const sendOsNotification = (title: string, body: string) => {
-    invoke('send_notification_cmd', {title, body}).catch(err =>
-        console.warn('Failed to send OS notification:', err)
-    );
-};
 
 const UpdateLogPage: React.FC<UpdateLogPanelProps> = ({
                                                           appName,
@@ -44,57 +38,31 @@ const UpdateLogPage: React.FC<UpdateLogPanelProps> = ({
     const [notesLoading, setNotesLoading] = useState(true);
     const [notesError, setNotesError] = useState<string | null>(null);
 
-    // Track previous completed/failed to fire notification exactly once on transition
-    const prevCompletedRef = useRef(completed);
-    const prevFailedRef = useRef(failed);
-
     useEffect(() => {
+        let disposed = false;
         const fetchNotes = async () => {
             setNotesLoading(true);
             setNotes(null);
             setNotesError(null);
             try {
                 const fetchedNotes = await invoke<string[]>("get_update_notes", {appName, version});
-                setNotes(fetchedNotes.join("\n"));
+                if (!disposed) setNotes(fetchedNotes.join("\n"));
             } catch (err) {
                 console.error(`Failed to get notes for ${appName} version ${version}:`, err);
-                const errorMessage = err instanceof Error ? err.message : String(err);
-                setNotesError(t('Failed to load notes: {{error}}', {error: errorMessage}));
+                const errorMessage = typeof err === 'object' && err !== null && 'message' in err ? String(err.message) : String(err);
+                if (!disposed) setNotesError(t('Failed to load notes: {{error}}', {error: errorMessage}));
             } finally {
-                setNotesLoading(false);
+                if (!disposed) setNotesLoading(false);
             }
         };
 
         if (appName && version) {
             fetchNotes();
         }
+        return () => {disposed = true;};
     }, [appName, version, t]);
 
-    // Fire OS notification when completed or failed state changes
-    useEffect(() => {
-        const wasCompleted = prevCompletedRef.current;
-        const wasFailed = prevFailedRef.current;
-        prevCompletedRef.current = completed;
-        prevFailedRef.current = failed;
-
-        if (!wasCompleted && completed) {
-            const title = `${t(`${actionType} success`)}: ${appName}`;
-            const body = notes ? `${version}\n${notes}` : version;
-            sendOsNotification(title, body);
-        } else if (!wasFailed && failed) {
-            const title = `${t(`${actionType} failed`)}: ${appName}`;
-            const body = notes ? `${version}\n${notes}` : version;
-            sendOsNotification(title, body);
-        }
-    }, [completed, failed, actionType, appName, version, notes, t]);
-
-    const handleConfirm = () => {
-        // Send notification when user manually triggers update/downgrade
-        const title = `${t(actionType)}: ${appName}`;
-        const body = notes ? `${version}\n${notes}` : version;
-        sendOsNotification(title, body);
-        onConfirm({appName, version, actionType});
-    };
+    const handleConfirm = () => onConfirm({appName, version, actionType, notes: notes ?? undefined});
 
     const handleOpenWebsite = async () => {
         const target = website?.trim();

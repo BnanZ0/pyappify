@@ -1,4 +1,5 @@
 // src/SettingsPage.tsx
+import MirrorSettings, {type MirrorSettingsApp} from "./features/mirror/MirrorSettings";
 import React, {useEffect, useState} from 'react';
 import {
     Box,
@@ -17,7 +18,7 @@ import i18n from "i18next";
 import {useTranslation} from 'react-i18next';
 import {invoke} from "@tauri-apps/api/core";
 import {invokeTauriCommandWrapper} from "./utils.ts";
-import {ThemeModeSetting} from "./App.tsx";
+import type {SettingsRequest, ThemeModeSetting} from "./types";
 
 interface StatusUpdateProps {
     updateStatus: (newStatus: { error?: string | null, info?: string | null, messageLoading?: boolean }) => void;
@@ -25,6 +26,10 @@ interface StatusUpdateProps {
 }
 
 interface SettingsPageProps extends StatusUpdateProps {
+    app: MirrorSettingsApp | null;
+    busy: boolean;
+    saving: boolean;
+    runRequest: SettingsRequest;
     currentTheme: ThemeModeSetting;
     onChangeTheme: (theme: ThemeModeSetting) => void;
     onBack: () => void;
@@ -54,7 +59,7 @@ const getPipIndexUrlName = (url: string, t: (key: string) => string) => {
     return url;
 };
 
-const SettingsPage: React.FC<SettingsPageProps> = ({ currentTheme, onChangeTheme, onBack, updateStatus, clearMessages }) => {
+const SettingsPage: React.FC<SettingsPageProps> = ({ app, busy, saving, runRequest, currentTheme, onChangeTheme, onBack, updateStatus, clearMessages }) => {
     const {t} = useTranslation();
     const [configs, setConfigs] = useState<ConfigItemFromRust[] | null>(null);
     const [isLoading, setIsLoading] = useState(true);
@@ -82,16 +87,22 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ currentTheme, onChangeTheme
     const handleSettingChange = async (name: string, value: string | number) => {
         clearMessages();
         updateStatus({messageLoading: true});
-        await invokeTauriCommandWrapper<void>(
-            'update_config_item', {name, value},
-            async () => {
-                const updatedConfigs = await invoke<ConfigItemFromRust[]>('get_config_payload');
-                setConfigs(updatedConfigs);
-                if (name === LANGUAGE_CONFIG_KEY) i18n.changeLanguage(value as string);
-                updateStatus({info: `${name} updated successfully.`, messageLoading: false});
-            },
-            (errorMsg) => updateStatus({error: `Failed to update ${name}: ${errorMsg}`, messageLoading: false})
-        );
+        try {
+            await runRequest(async () => {
+                await invokeTauriCommandWrapper<void>(
+                    'update_config_item', {name, value},
+                    async () => {
+                        const updatedConfigs = await invoke<ConfigItemFromRust[]>('get_config_payload');
+                        setConfigs(updatedConfigs);
+                        if (name === LANGUAGE_CONFIG_KEY) i18n.changeLanguage(value as string);
+                        updateStatus({info: `${name} updated successfully.`, messageLoading: false});
+                    },
+                    (errorMsg) => updateStatus({error: `Failed to update ${name}: ${errorMsg}`, messageLoading: false})
+                );
+            });
+        } catch (error) {
+            updateStatus({error: `Failed to update ${name}: ${String(error)}`, messageLoading: false});
+        }
     };
 
     if (isLoading || !configs) {
@@ -115,18 +126,23 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ currentTheme, onChangeTheme
                 {[
                     { label: t('Language'), config: languageConfig, handler: (e: SelectChangeEvent) => handleSettingChange(LANGUAGE_CONFIG_KEY, e.target.value), renderOption: (o: string) => languageNames[o] || o },
                     { label: t('Theme'), config: themeConfig, handler: (e: SelectChangeEvent) => onChangeTheme(e.target.value as ThemeModeSetting), renderOption: (o: string) => t(o.charAt(0).toUpperCase() + o.slice(1)) },
-                    { label: t('Pip Cache Directory'), config: pipCacheConfig, handler: (e: SelectChangeEvent) => handleSettingChange(PIP_CACHE_DIR_CONFIG_KEY, e.target.value), renderOption: (o: string) => t(o) },
-                    { label: t('Pip Index URL'), config: pipIndexUrlConfig, handler: (e: SelectChangeEvent) => handleSettingChange(PIP_INDEX_URL_CONFIG_KEY, e.target.value), renderOption: (o: string) => getPipIndexUrlName(o, t) },
-                ].map(({ label, config, handler, renderOption }) => config && (
-                    <Box key={label} sx={{my: 2}}>
-                        <FormControl fullWidth variant="outlined">
-                            <InputLabel>{label}</InputLabel>
-                            <Select value={(config.value as string) || ''} label={label} onChange={handler}>
-                                {(config.options as string[])?.map(o => <MenuItem key={o} value={o}>{renderOption(o)}</MenuItem>)}
-                            </Select>
-                        </FormControl>
-                    </Box>
-                ))}
+                    <MirrorSettings key="mirror-settings" app={app} busy={busy} saving={saving} runRequest={runRequest}/>,
+                    { label: t('Pip Cache Directory'), config: app?.update_source === 'mirrorchyan' ? undefined : pipCacheConfig, handler: (e: SelectChangeEvent) => handleSettingChange(PIP_CACHE_DIR_CONFIG_KEY, e.target.value), renderOption: (o: string) => t(o) },
+                    { label: t('Pip Index URL'), config: app?.update_source === 'mirrorchyan' ? undefined : pipIndexUrlConfig, handler: (e: SelectChangeEvent) => handleSettingChange(PIP_INDEX_URL_CONFIG_KEY, e.target.value), renderOption: (o: string) => getPipIndexUrlName(o, t) },
+                ].map(item => {
+                    if (!('config' in item)) return item;
+                    const { label, config, handler, renderOption } = item;
+                    return config && (
+                        <Box key={label} sx={{my: 2}}>
+                            <FormControl fullWidth variant="outlined" disabled={busy && config !== themeConfig}>
+                                <InputLabel>{label}</InputLabel>
+                                <Select value={(config.value as string) || ''} label={label} onChange={handler}>
+                                    {(config.options as string[])?.map(o => <MenuItem key={o} value={o}>{renderOption(o)}</MenuItem>)}
+                                </Select>
+                            </FormControl>
+                        </Box>
+                    );
+                })}
                 <Box sx={{mt: 4, display: 'flex', justifyContent: 'center'}}>
                     <Button variant="outlined" onClick={onBack}>{t('Back to App')}</Button>
                 </Box>

@@ -5,7 +5,10 @@ mod config_manager;
 mod emitter;
 mod execute_python;
 pub mod extensions;
+mod frozen;
 mod git;
+mod mirror;
+pub use frozen::packaging;
 mod python_env;
 mod runas;
 mod submodule;
@@ -505,6 +508,13 @@ pub async fn run() {
                 .unwrap_or(1);
             eprintln!("{error:#}");
             std::process::exit(code);
+        }
+        return;
+    }
+    if let Some(result) = frozen::packaging::try_run(&command_line_args) {
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+            std::process::exit(1);
         }
         return;
     }

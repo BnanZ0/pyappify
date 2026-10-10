@@ -1,3 +1,4 @@
+use crate::extensions::cancellation;
 // src/python_env.rs
 use crate::config_manager::get_default_locale;
 use crate::utils::command::new_cmd;
@@ -137,6 +138,12 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
 
     let download_result = match download_file(&primary_url, &archive_path, app_name).await {
         Ok(()) => Ok(()),
+        Err(e)
+            if e.downcast_ref::<Error>()
+                .is_some_and(cancellation::is_cancelled) =>
+        {
+            Err(e)
+        }
         Err(e) => {
             warn!(
                 "Download from primary URL {} failed: {:#}. Trying backup URL: {}",
@@ -211,7 +218,13 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
         archive_path.display(),
         install_dir.display()
     );
-    if let Err(extract_err) = extract_archive(&archive_path, &install_dir) {
+    let extract_result = (|| -> Result<()> {
+        cancellation::ensure_app_operation_not_cancelled()?;
+        extract_archive(&archive_path, &install_dir)?;
+        cancellation::ensure_app_operation_not_cancelled()?;
+        Ok(())
+    })();
+    if let Err(extract_err) = extract_result {
         error!(
             "Extraction from {} to {} failed: {:#}",
             archive_path.display(),
@@ -437,17 +450,17 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
         client_builder = client_builder.user_agent(get_user_agent());
     }
     let client = client_builder.build()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
+    let response = cancellation::wait(app_name, client.get(url).send())
+        .await?
         .with_context(|| format!("Failed to initiate download from {}", url))?;
 
     let status = response.status();
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_else(|_| {
-            String::from("(could not retrieve error body from non-success response)")
-        });
+        let error_body = cancellation::wait(app_name, response.text())
+            .await?
+            .unwrap_or_else(|_| {
+                String::from("(could not retrieve error body from non-success response)")
+            });
         return Err(anyhow!(
             "Download from {} failed: Status {} {}",
             url,
@@ -469,7 +482,9 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
     let mut last_reported_percent: i64 = -1;
 
     let mut stream = response.bytes_stream();
-    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+    while let Some(item) =
+        cancellation::wait(app_name, futures_util::StreamExt::next(&mut stream)).await?
+    {
         let chunk =
             item.with_context(|| format!("Failed to read chunk from download stream of {}", url))?;
         file.write_all(&chunk)
@@ -588,12 +603,29 @@ pub async fn install_requirements(
     }
 
     let marker_path = project_dir.join(PIP_UPDATE_NEEDED_MARKER);
-    fs::File::create(&marker_path).ok();
+    fs::File::create(&marker_path).with_context(|| {
+        format!(
+            "Failed to create pip retry marker {}",
+            marker_path.display()
+        )
+    })?;
 
-    command::run_command_and_stream_output(pip_install_cmd, app_name, &pip_install_desc).await?;
+    if let Some(token) = cancellation::current_token(app_name) {
+        command::run_command_cancellable(pip_install_cmd, app_name, &pip_install_desc, token)
+            .await?;
+        cancellation::begin_commit()?;
+    } else {
+        command::run_command_and_stream_output(pip_install_cmd, app_name, &pip_install_desc)
+            .await?;
+    }
 
-    if marker_path.exists() {
-        let _ = fs::remove_file(&marker_path);
+    if marker_path.try_exists()? {
+        fs::remove_file(&marker_path).with_context(|| {
+            format!(
+                "Failed to remove pip retry marker {}",
+                marker_path.display()
+            )
+        })?;
     }
 
     clean_python_install(app_name, get_python_dir(app_name).as_ref())?;

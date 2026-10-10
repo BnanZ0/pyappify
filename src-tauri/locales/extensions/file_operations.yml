@@ -1,0 +1,15 @@
+_version: 2
+file_operations.rm_scan:
+  en: "RM: Scanning target directories to collect files to check..."
+  zh-CN: "RM: 正在扫描目标目录, 收集待检查的文件……"
+  zh-TW: "RM: 正在掃描目標目錄, 收集待檢查的檔案……"
+  es: "RM: Escaneando los directorios de destino para recopilar los archivos que se deben comprobar..."
+  ja: "RM: 対象ディレクトリをスキャンして、確認するファイルを収集しています……"
+  ko: "RM: 대상 디렉터리를 검색하여 확인할 파일을 수집하고 있습니다……"
+file_operations.rm_release:
+  en: "RM: Registering %{files} files, identifying and closing applications using them. Please wait... (Directory scan: %{seconds} s)"
+  zh-CN: "RM: 正在登记 %{files} 个文件、查询并关闭占用程序, 请稍候……（目录扫描耗时 %{seconds} 秒）"
+  zh-TW: "RM: 正在登記 %{files} 個檔案、查詢並關閉占用程式, 請稍候……（目錄掃描耗時 %{seconds} 秒）"
+  es: "RM: Registrando %{files} archivos, identificando y cerrando las aplicaciones que los utilizan. Espere... (Escaneo de directorios: %{seconds} s)"
+  ja: "RM: %{files} 個のファイルを登録し、使用中のアプリケーションを特定して終了しています。お待ちください……（ディレクトリのスキャン時間: %{seconds} 秒）"
+  ko: "RM: 파일 %{files}개를 등록하고 사용 중인 프로그램을 찾아 종료하고 있습니다. 잠시 기다려 주세요……（디렉터리 검색 시간: %{seconds}초）"

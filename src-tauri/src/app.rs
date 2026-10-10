@@ -63,6 +63,11 @@ pub struct App {
     pub auto_start: bool,
     #[serde(default)]
     pub update_state: AppUpdateState,
+    /// In-memory task identity; it is never restored from saved configuration.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<crate::extensions::cancellation::Operation>,
+    #[serde(skip_deserializing, skip_serializing_if = "revision_is_zero")]
+    pub revision: u64,
     #[serde(default)]
     pub update_target_version: Option<String>,
     #[serde(default)]
@@ -77,7 +82,18 @@ fn default_last_start_fn() -> DateTime<Utc> {
     Utc::now()
 }
 
+fn revision_is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+
 impl App {
+    pub(crate) fn configuration(&self) -> Self {
+        let mut app = self.clone();
+        app.operation = None;
+        app.revision = 0;
+        app
+    }
+
     pub fn get_repo_path(&self) -> PathBuf {
         path::get_app_repo_path(&self.name)
     }
@@ -263,7 +279,7 @@ pub(crate) fn get_app_config_json_path(app_name: &str) -> PathBuf {
 
 pub(crate) async fn save_app_config_to_json(app: &App) -> anyhow::Result<()> {
     let config_path = get_app_config_json_path(&app.name);
-    let json_data = serde_json::to_string_pretty(app)
+    let json_data = serde_json::to_string_pretty(&app.configuration())
         .with_context(|| format!("Failed to serialize app config for {}", app.name))?;
     if let Some(parent) = config_path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {

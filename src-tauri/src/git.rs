@@ -1,3 +1,4 @@
+use crate::extensions::cancellation;
 //git.rs
 use crate::{app::App, emit_info, emit_update_info, submodule};
 use anyhow::{Context, Result};
@@ -192,8 +193,12 @@ fn create_transfer_progress_callback(
     app_name: String,
     prefix: String,
 ) -> impl FnMut(Progress<'_>) -> bool + 'static {
+    let token = cancellation::current_token(&app_name);
     let mut last_percent = -1.0;
     move |progress: Progress| {
+        if token.as_ref().is_some_and(|token| !token.git_progress()) {
+            return false;
+        }
         let received_objects = progress.received_objects();
         let total_objects = progress.total_objects();
         if total_objects > 0 {
@@ -624,7 +629,7 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
                         });
 
                     emit_update_info!(app_name_for_task, "");
-                    fetch_result?;
+                    cancellation::git_result(&app_name_for_task, fetch_result)?;
                     prune_deleted_local_tags_from_remote(&repo, "origin", &app_name_for_task)?;
                     emit_info!(app_name_for_task, "Fetch complete.");
                     Ok(())
@@ -657,9 +662,13 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
         let mut callbacks = RemoteCallbacks::new();
         configure_credentials(&mut callbacks, Some(&url_for_clone_task));
         let app_name_for_progress_clone = app_name_for_messages.clone();
+        let token = cancellation::current_token(&app_name_for_messages);
         callbacks.transfer_progress({
             let mut last_percent = -1.0;
             move |progress: Progress| {
+                if token.as_ref().is_some_and(|token| !token.git_progress()) {
+                    return false;
+                }
                 let received_objects = progress.received_objects();
                 let total_objects = progress.total_objects();
                 let indexed_objects = progress.indexed_objects();
@@ -706,9 +715,12 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
             url_for_clone_task,
             repo_path_for_clone_task.display()
         );
-        let repo = builder
-            .clone(&url_for_clone_task, &repo_path_for_clone_task)
-            .with_context(|| format!("Git clone failed for {}", url_for_clone_task))?;
+        let repo = cancellation::git_result(
+            &app_name_for_messages,
+            builder
+                .clone(&url_for_clone_task, &repo_path_for_clone_task)
+                .with_context(|| format!("Git clone failed for {}", url_for_clone_task)),
+        )?;
 
         emit_info!(
             app_name_for_messages,
@@ -836,7 +848,7 @@ pub async fn checkout_version_tag(
                 )
             });
         emit_update_info!(app_name_for_task, "");
-        fetch_result?;
+        cancellation::git_result(&app_name_for_task, fetch_result)?;
         prune_deleted_local_tags_from_remote(&repo, "origin", &app_name_for_task)?;
 
         debug!("Fetch successful for tag {}", tag_to_checkout);

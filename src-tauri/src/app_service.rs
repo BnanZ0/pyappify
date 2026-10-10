@@ -4,6 +4,7 @@ use crate::app::{
     UPDATE_METHOD_OPTION_MANUAL,
 };
 use crate::emitter::get_app_handle;
+use crate::extensions::cancellation;
 use crate::git::ensure_repository;
 use crate::runas;
 use crate::utils::error::Error;
@@ -134,8 +135,15 @@ fn get_update_target<'a>(
         .max_by(|left, right| git::compare_version_tags(left, right).unwrap_or(Ordering::Equal))
 }
 
+static APP_SNAPSHOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub async fn get_app() -> Option<App> {
-    let mut app = APP.lock().await.clone()?;
+    let mut app = {
+        let current = APP.lock().await;
+        let mut app = current.clone()?;
+        app.revision = APP_SNAPSHOT_SEQUENCE.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        app
+    };
     let startup_overrides = STARTUP_OVERRIDES.lock().await.clone();
     if let Some(auto_start) = startup_overrides.auto_start {
         app.auto_start = auto_start;
@@ -143,6 +151,7 @@ pub async fn get_app() -> Option<App> {
     if let Some(update_method) = &startup_overrides.update_method {
         app.update_method = update_method.clone();
     }
+    app.operation = cancellation::current_operation(&app.name);
     Some(app)
 }
 
@@ -175,6 +184,9 @@ async fn persist_update_state(
 }
 
 async fn ensure_app_is_ready_to_start(app_name: &str) -> Result<()> {
+    if cancellation::current_kind(app_name).is_some() {
+        bail!("Process in progress...");
+    }
     let app_guard = APP.lock().await;
     let app = app_guard
         .as_ref()
@@ -1879,6 +1891,20 @@ async fn kill_app_processes(app_name: &str) -> Result<bool> {
 }
 
 #[tauri::command]
+pub async fn cancel_app_operation(app_name: String, operation_id: String) -> Result<bool, Error> {
+    info!(
+        "Cancelling the active install/update operation for: {}",
+        app_name
+    );
+    let accepted = cancellation::request_cancellation(&app_name, &operation_id);
+    if accepted {
+        AUTO_START_CANCELLED.store(true, AtomicOrdering::SeqCst);
+        emit_info!(&app_name, "Cancelling the current operation...");
+    }
+    Ok(accepted)
+}
+
+#[tauri::command]
 pub async fn stop_app(app_name: String) -> Result<(), Error> {
     info!("Attempting to stop app: {}", app_name);
     let app_dir_lock = get_app_lock(&app_name).await?;
@@ -2033,6 +2059,10 @@ pub async fn periodically_update_app_running_status(app_handle: AppHandle) {
 
         let changed = {
             let mut app_guard = APP.lock().await;
+            // Installation commands run Python/pip from this directory too.
+            if cancellation::current_kind(&app_name).is_some() {
+                continue;
+            }
             if let Some(app) = app_guard.as_mut().filter(|app| app.name == app_name) {
                 if app.running != new_status {
                     debug!(

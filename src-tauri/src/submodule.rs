@@ -19,13 +19,29 @@ pub fn update_repository_submodules(
             context_message
         );
         for mut submodule in submodules {
-            submodule.update(true, None).with_context(|| {
-                format!(
-                    "Failed to update submodule '{}' for {}",
-                    submodule.name().unwrap_or("<unknown>"),
-                    context_message
-                )
-            })?;
+            let token = crate::extensions::cancellation::current_token(app_name);
+            let update = if let Some(token) = token {
+                token.check()?;
+                let mut callbacks = git2::RemoteCallbacks::new();
+                callbacks.transfer_progress(move |_| token.git_progress());
+                let mut fetch = git2::FetchOptions::new();
+                fetch.remote_callbacks(callbacks);
+                let mut options = git2::SubmoduleUpdateOptions::new();
+                options.fetch(fetch);
+                submodule.update(true, Some(&mut options))
+            } else {
+                submodule.update(true, None)
+            };
+            crate::extensions::cancellation::git_result(
+                app_name,
+                update.with_context(|| {
+                    format!(
+                        "Failed to update submodule '{}' for {}",
+                        submodule.name().unwrap_or("<unknown>"),
+                        context_message
+                    )
+                }),
+            )?;
             emit_info!(
                 app_name,
                 "Successfully updated submodule: {} for {}",

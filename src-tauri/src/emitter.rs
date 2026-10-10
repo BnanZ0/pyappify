@@ -15,6 +15,7 @@ pub fn init_app_handle(handle: AppHandle<Wry>) {
 #[derive(Clone, Serialize)]
 struct MessagePayload<'a> {
     app_name: String,
+    operation_id: Option<String>,
     message: &'a str,
     #[serde(default)]
     update: bool,
@@ -22,6 +23,8 @@ struct MessagePayload<'a> {
     finished: bool,
     #[serde(default)]
     error: bool,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 pub fn get_app_handle() -> Option<&'static AppHandle<Wry>> {
@@ -48,6 +51,23 @@ pub(crate) fn emit_log_impl(
     is_update_param: bool,
     is_error: bool,
 ) {
+    let operation_id = crate::extensions::cancellation::current_id(&app_name);
+    emit_log_for_operation(
+        app_name,
+        original_message,
+        is_update_param,
+        is_error,
+        operation_id,
+    );
+}
+
+pub(crate) fn emit_log_for_operation(
+    app_name: String,
+    original_message: &str,
+    is_update_param: bool,
+    is_error: bool,
+    operation_id: Option<String>,
+) {
     if is_error && original_message.is_empty() {
         error!(
             "Attempted to emit an empty error message for app: {} (update: {})",
@@ -69,11 +89,13 @@ pub(crate) fn emit_log_impl(
     emit(
         "app-log",
         MessagePayload {
+            operation_id,
             app_name: app_name.clone(),
             message: actual_message,
             update: final_is_update,
             finished: false,
             error: is_error,
+            cancelled: false,
         },
     );
 
@@ -92,15 +114,32 @@ pub(crate) fn emit_finish_impl(app_name: String, is_error: bool) {
     emit(
         "app-log",
         MessagePayload {
+            operation_id: crate::extensions::cancellation::current_id(&app_name),
             app_name: app_name.clone(),
             message: "",
             update: false,
             finished: true,
             error: is_error,
+            cancelled: false,
         },
     );
     let status = if is_error { "FAILED" } else { "COMPLETED" };
     println!("FINISHED [{}]: Process {}.", app_name, status);
+}
+
+pub(crate) fn emit_cancelled_finish(app_name: &str) {
+    emit(
+        "app-log",
+        MessagePayload {
+            operation_id: crate::extensions::cancellation::current_id(app_name),
+            app_name: app_name.into(),
+            message: "Operation cancelled",
+            update: false,
+            finished: true,
+            error: false,
+            cancelled: true,
+        },
+    );
 }
 
 #[macro_export]

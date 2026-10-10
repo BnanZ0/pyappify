@@ -91,12 +91,28 @@ fn attempt_then_release(
     })
 }
 
+/// Background callers supply the task identity captured before dispatch.
+pub(crate) struct LogContext {
+    pub app_name: String,
+    pub operation_id: Option<String>,
+}
+
+impl LogContext {
+    fn current() -> Option<Self> {
+        super::cancellation::current_log_context().map(|(app_name, operation_id)| Self {
+            app_name,
+            operation_id: Some(operation_id),
+        })
+    }
+}
+
 fn run(
     operation: &str,
     purpose: &str,
     paths: &[&Path],
     cancelled: &(dyn Fn() -> bool + Sync),
     rm_scope: RmFileScope,
+    log_context: Option<LogContext>,
     mut action: impl FnMut() -> io::Result<()>,
 ) -> Result<()> {
     let mut occupants = String::new();
@@ -104,11 +120,31 @@ fn run(
         tracing::warn!(operation, purpose, paths=?paths, windows_error=?first.raw_os_error(), %first,
             "File operation failed; trying Restart Manager before one retry");
         occupants = "未识别占用进程".into();
+        let progress = |message: &str| {
+            if let Some(context) = &log_context {
+                crate::emitter::emit_log_for_operation(
+                    context.app_name.clone(),
+                    message,
+                    false,
+                    false,
+                    context.operation_id.clone(),
+                );
+            } else {
+                tracing::info!(operation, purpose, "{message}");
+            }
+        };
         let result = (|| {
+            progress(&t!("file_operations.rm_scan"));
+            let scan_started = std::time::Instant::now();
             let files = restart_manager::operation_files(paths, rm_scope, cancelled)?;
             if files.is_empty() {
                 return Ok(());
             }
+            progress(&t!(
+                "file_operations.rm_release",
+                files = files.len(),
+                seconds = format!("{:.3}", scan_started.elapsed().as_secs_f64()),
+            ));
             let mut session = restart_manager::Session::new(&files, &[], cancelled)?;
             let affected = session.occupiers()?;
             if !affected.is_empty() {
@@ -271,6 +307,7 @@ fn move_inner(
         &[&source, &destination],
         cancelled,
         rm_scope,
+        LogContext::current(),
         action,
     )
 }
@@ -328,6 +365,17 @@ pub fn remove_tree(
     purpose: &str,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
+    remove_tree_with_log(path, policy, purpose, cancelled, LogContext::current())
+}
+
+/// An explicit None logs diagnostics without consulting the active task.
+pub(crate) fn remove_tree_with_log(
+    path: &Path,
+    policy: DeletePolicy,
+    purpose: &str,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    log_context: Option<LogContext>,
+) -> Result<()> {
     let path = absolute(path)?;
     validate_tree(&path, policy == DeletePolicy::Disposable, cancelled)?;
     run(
@@ -336,6 +384,7 @@ pub fn remove_tree(
         &[&path],
         cancelled,
         RmFileScope::NativeImages,
+        log_context,
         || match fs::remove_dir_all(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -348,6 +397,15 @@ pub fn remove_file(
     purpose: &str,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
+    remove_file_with_log(path, purpose, cancelled, LogContext::current())
+}
+
+pub(crate) fn remove_file_with_log(
+    path: &Path,
+    purpose: &str,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    log_context: Option<LogContext>,
+) -> Result<()> {
     let path = absolute(path)?;
     run(
         "delete file",
@@ -355,6 +413,7 @@ pub fn remove_file(
         &[&path],
         cancelled,
         RmFileScope::NativeImages,
+        log_context,
         || match fs::remove_file(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -384,6 +443,7 @@ pub(crate) fn remove_empty_dir_with_rm_scope(
         &[&path],
         cancelled,
         rm_scope,
+        LogContext::current(),
         || match fs::remove_dir(&path) {
             Err(error)
                 if matches!(
@@ -402,6 +462,43 @@ pub(crate) fn remove_empty_dir_with_rm_scope(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn rm_translations_load_from_the_extension_catalog_in_all_six_languages() {
+        let english = t!(
+            "file_operations.rm_release",
+            locale = "en",
+            files = "729",
+            seconds = "1.568"
+        );
+        for (locale, scan_word) in [
+            ("en", "Scanning"),
+            ("zh-CN", "扫描"),
+            ("zh-TW", "掃描"),
+            ("es", "Escaneando"),
+            ("ja", "対象"),
+            ("ko", "대상"),
+        ] {
+            assert!(
+                t!("file_operations.rm_scan", locale = locale).contains(scan_word),
+                "{locale}"
+            );
+            let release = t!(
+                "file_operations.rm_release",
+                locale = locale,
+                files = "729",
+                seconds = "1.568"
+            );
+            assert!(
+                release.contains("729") && release.contains("1.568"),
+                "{locale}: {release}"
+            );
+            assert!(!release.contains("%{"));
+            if locale != "en" {
+                assert_ne!(release, english, "{locale} fell back to English");
+            }
+        }
+    }
 
     #[test]
     fn successful_and_permanent_operations_never_call_rm() {

@@ -661,11 +661,12 @@ pub fn cleanup(root: &Path) -> Result<()> {
             .starts_with(&format!("{TASK_DIR}-completed-"))
         {
             if !is_reparse(&fs::symlink_metadata(entry.path())?) {
-                if let Err(error) = file_ops::remove_tree(
+                if let Err(error) = file_ops::remove_tree_with_log(
                     &entry.path(),
                     DeletePolicy::Disposable,
                     "Mirror committed backup cleanup",
                     &|| false,
+                    None,
                 ) {
                     errors.push(format!("{}: {error:#}", entry.path().display()));
                 }

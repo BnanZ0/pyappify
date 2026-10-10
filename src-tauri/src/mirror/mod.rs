@@ -34,3 +34,11 @@ fn stable_channel() -> String {
     "stable".into()
 }
 
+pub mod api;
+pub mod credentials;
+pub mod download;
+pub(crate) mod service;
+
+pub mod archive;
+
+pub(crate) mod installation;

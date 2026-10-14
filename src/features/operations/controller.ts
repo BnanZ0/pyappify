@@ -76,6 +76,11 @@ export function createLauncherController(transport: Transport, translate: TFunct
         const previous = state.app;
         let proposal = state.proposal;
         if (previous?.update_source !== app.update_source) { proposal = null; proposalDismissed = false; }
+        if (proposal && app.update_source === 'mirrorchyan' && !isTaskActive(state.task)
+            && proposal.version !== app.current_version && !app.available_versions.includes(proposal.version)) {
+            const latest = app.available_versions[0];
+            if (latest) proposal = {version: latest, actionType: getVersionActionType(latest, app.current_version)};
+        }
         if (!proposal && !proposalDismissed && app.installed && !sourceNeedsInstallation(app) && !app.running && !isTaskActive(state.task)) {
             if (app.update_state === 'failed' && app.update_target_version) {
                 proposal = {version: app.update_target_version, actionType: getVersionActionType(app.update_target_version, app.current_version, 'Upgrade')};

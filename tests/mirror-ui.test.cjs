@@ -17,7 +17,7 @@ const baseApp = {revision: 1, name: 'ok-nte', icon: '', website: null, current_v
     update_state: 'idle', update_target_version: null, update_error: null, source_operation_state: 'idle',
     mirrorchyan: {resource_id: 'ok-nte'}, auto_start: false, update_method: 'MANUAL_UPDATE', operation: null};
 
-async function fixture(overrides = {}, savedLogs = [], hasCdk = true) {
+async function fixture(overrides = {}, savedLogs = [], hasCdk = true, notesLookup = () => ['Release notes']) {
     localStorage.clear();
     localStorage.setItem('pyappifyConsoleLogs', JSON.stringify({'ok-nte': savedLogs}));
     const listeners = new Map(), calls = [], pending = [], cache = new Map(), failures = new Map();
@@ -31,7 +31,9 @@ async function fixture(overrides = {}, savedLogs = [], hasCdk = true) {
             if (command === 'load_app') {emit('app', app); return Promise.resolve(app);}
             if (command === 'mirrorchyan_has_cdk') return Promise.resolve(hasCdk);
             if (command === 'get_config_payload') return Promise.resolve([]);
-            if (command === 'get_update_notes') return Promise.resolve(['Release notes']);
+            if (command === 'get_update_notes') return Promise.resolve(notesLookup(args, change => {
+                app = {...app, ...change, revision: app.revision + 1}; emit('app', app);
+            }));
             if (command === 'get_app_icon') return Promise.resolve(null);
             if (command === 'setup_app' || command === 'update_to_version') {
                 const source = app.update_source === 'git' ? 'git' : 'mirror';
@@ -129,6 +131,44 @@ test('Mirror upgrade with a saved CDK starts the update', async () => {
         assert.equal(f.calls.find(call => call.command === 'update_to_version').args.version, 'v1.4.9');
         assert.ok(f.button('Cancel'));
         await f.complete('succeeded');
+    } finally {await f.dispose();}
+});
+
+test('Mirror stale version switches the proposal, selector, notes and confirmation to latest', async () => {
+    const f = await fixture({update_source: 'mirrorchyan', installed: true, current_version: 'v1.4.11',
+        available_versions: ['v1.4.12'], installation: {source: 'mirrorchyan', version: 'v1.4.11'}}, [], true,
+        (args, publish) => {
+            if (args.version === 'v1.4.12') publish({available_versions: ['v1.4.13']});
+            return ['Latest release notes'];
+        });
+    try {
+        assert.ok(f.container.textContent.includes('Upgrade: v1.4.13'));
+        assert.ok(f.container.textContent.includes('Latest release notes'));
+        assert.ok(!f.container.textContent.includes('Only the latest MirrorChyan release is available'));
+        assert.ok([...f.container.querySelectorAll('[role="combobox"]')].some(element => element.textContent.includes('v1.4.13')));
+        assert.ok(f.calls.some(call => call.command === 'get_update_notes' && call.args.version === 'v1.4.13'));
+        await f.click('Confirm Upgrade');
+        assert.equal(f.calls.find(call => call.command === 'update_to_version').args.version, 'v1.4.13');
+        assert.equal(f.operation().target_version, 'v1.4.13');
+        const notification = f.calls.find(call => call.command === 'send_notification_cmd');
+        assert.equal(notification.args.body, 'v1.4.13\nLatest release notes');
+    } finally {await f.dispose();}
+});
+
+test('notes returned after cancelling the proposal cannot restore an obsolete latest target', async () => {
+    const pendingNotes = [];
+    const f = await fixture({update_source: 'mirrorchyan', installed: true, current_version: 'v1.4.11',
+        available_versions: ['v1.4.12'], installation: {source: 'mirrorchyan', version: 'v1.4.11'}}, [], true,
+        () => new Promise(resolve => pendingNotes.push(resolve)));
+    try {
+        const select = [...f.container.querySelectorAll('[role="combobox"]')].find(element => element.textContent.includes('v1.4.12'));
+        await act(async () => select.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})));
+        await act(async () => document.querySelector('[role="option"][data-value=""]').click());
+        await f.publishApp({available_versions: ['v1.4.13']});
+        await act(async () => pendingNotes.forEach(resolve => resolve(['Obsolete notes'])));
+        assert.ok(!f.container.textContent.includes('Upgrade: v1.4.13'));
+        assert.ok(!f.container.textContent.includes('Obsolete notes'));
+        assert.ok(!f.button('Confirm Upgrade'));
     } finally {await f.dispose();}
 });
 

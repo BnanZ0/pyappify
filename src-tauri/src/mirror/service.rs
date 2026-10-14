@@ -344,7 +344,13 @@ pub(crate) async fn update_notes(app: &App, version: &str) -> Result<Vec<String>
     }
     let release = crate::mirror::api::latest(app).await?;
     if release.version_name != version {
-        return Err(err!("Only the latest MirrorChyan release is available"));
+        // Publish the latest version through the existing app state flow.
+        if let Some(current) = APP.lock().await.as_mut().filter(|current| {
+            current.name == app.name && current.update_source == UpdateSource::Mirrorchyan
+        }) {
+            current.available_versions = vec![release.version_name];
+        }
+        emit_app().await;
     }
     Ok(vec![release.release_note])
 }

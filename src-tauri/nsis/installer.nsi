@@ -22,6 +22,7 @@ ManifestDPIAwareness PerMonitorV2
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
 !include "StrFunc.nsh"
+!include "Win\RestartManager.nsh"
 ${StrCase}
 ${StrLoc}
 
@@ -71,6 +72,24 @@ Var FirstNonCDrive
 Var InvalidDir_ProgramFiles_Msg
 Var InvalidDir_NonASCII_Msg
 Var SetupMutexHandle
+
+; BEGIN INSTALLER RESTART MANAGER STATE
+Var RestartManagerSession
+Var RestartManagerError
+Var RestartManagerStage
+Var RestartManagerResource
+Var RestartManagerFileCount
+Var RestartManagerBatchCount
+Var RestartManagerPathBuffer
+Var RestartManagerPathArray
+Var RestartManagerProcessCount
+Var RestartManagerRebootReasons
+Var RestartManagerMessage
+!define RESTART_MANAGER_BATCH_SIZE 256
+!define /math RESTART_MANAGER_PATH_BYTES ${NSIS_MAX_STRLEN} * 2
+!define /math RESTART_MANAGER_BUFFER_BYTES ${RESTART_MANAGER_BATCH_SIZE} * ${RESTART_MANAGER_PATH_BYTES}
+!define /math RESTART_MANAGER_ARRAY_BYTES ${RESTART_MANAGER_BATCH_SIZE} * ${NSIS_PTR_SIZE}
+; END INSTALLER RESTART MANAGER STATE
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -1011,37 +1030,247 @@ Function EnsureSingleSetupInstance
   ${EndIf}
 FunctionEnd
 
-Function KillInstallDirExecutables
-  ${IfNot} ${FileExists} "$INSTDIR\*.*"
-    Return
-  ${EndIf}
-
-  InitPluginsDir
-  ; Use the bundled version, including on first install. Keep it outside INSTDIR.
-  SetOutPath $PLUGINSDIR
-  File /oname=restart-manager.exe "${MAINBINARYSRCPATH}"
-  SetOutPath $INSTDIR
-
-  retry_kill_install_dir_executables:
-  DetailPrint "Closing programs using installation files with Restart Manager"
-  ClearErrors
-  ExecWait '"$PLUGINSDIR\restart-manager.exe" --installer-restart-manager "$INSTDIR" "$EXEPATH"' $R2
-  ${If} ${Errors}
-    StrCpy $R2 1
-  ${EndIf}
-  ${If} $R2 <> 0
-    ${If} ${Silent}
-      SetErrorLevel $R2
-      Abort
-    ${EndIf}
-    ${If} $LANGUAGE == 2052
-      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Restart Manager 无法关闭正在使用 $INSTDIR 中安装文件的程序（错误 $R2）。$\r$\n请关闭相关应用后点击“重试”。" IDRETRY retry_kill_install_dir_executables
-    ${Else}
-      MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "Restart Manager could not close programs using installation files in $INSTDIR (error $R2).$\r$\nClose the related application and click Retry." IDRETRY retry_kill_install_dir_executables
-    ${EndIf}
-    Abort
+; BEGIN INSTALLER RESTART MANAGER FUNCTIONS
+; All RM calls run inside setup. Never extract or launch a helper executable.
+Function StartInstallerRestartManager
+  StrCpy $RestartManagerStage "RmStartSession"
+  StrCpy $RestartManagerResource "$INSTDIR"
+  System::Call '"$SYSDIR\rstrtmgr.dll"::RmStartSession(*i .r1, i 0, w .r2) i .r0'
+  StrCpy $RestartManagerError $0
+  ${If} $RestartManagerError == 0
+    StrCpy $RestartManagerSession $1
+    ; Exclude setup even if it holds a registered module. RM also refuses
+    ; to shut down its own calling process (RmRebootReasonDetectedSelf).
+    StrCpy $RestartManagerStage "RmAddFilter (installer executable)"
+    StrCpy $RestartManagerResource "$EXEPATH"
+    System::Call '"$SYSDIR\rstrtmgr.dll"::RmAddFilter(i $RestartManagerSession, w "$EXEPATH", p 0, p 0, i 2) i .r0'
+    StrCpy $RestartManagerError $0
   ${EndIf}
 FunctionEnd
+
+Function FlushRestartManagerFiles
+  ${If} $RestartManagerBatchCount = 0
+    Return
+  ${EndIf}
+  ; Start lazily: an empty directory never needs an RM session.
+  ${If} $RestartManagerSession == ""
+    Call StartInstallerRestartManager
+  ${EndIf}
+  ${If} $RestartManagerError != 0
+    Return
+  ${EndIf}
+  StrCpy $RestartManagerStage "RmRegisterResources"
+  ; Preserve a resource from the failed batch in diagnostics.
+  System::Call '*$RestartManagerPathBuffer(&w${NSIS_MAX_STRLEN} .r1)'
+  StrCpy $RestartManagerResource $1
+  System::Call '"$SYSDIR\rstrtmgr.dll"::RmRegisterResources(i $RestartManagerSession, i $RestartManagerBatchCount, p $RestartManagerPathArray, i 0, p 0, i 0, p 0) i .r0'
+  StrCpy $RestartManagerError $0
+  ${If} $RestartManagerError == 0
+    IntOp $RestartManagerFileCount $RestartManagerFileCount + $RestartManagerBatchCount
+  ${EndIf}
+  StrCpy $RestartManagerBatchCount 0
+FunctionEnd
+
+Function ProbeRestartManagerFile
+  StrCpy $R3 $R9 4 -4
+  ; NSIS string comparisons are case insensitive (EXE/DLL/PYD included).
+  ${If} $R3 != ".exe"
+  ${AndIf} $R3 != ".dll"
+  ${AndIf} $R3 != ".pyd"
+    Return
+  ${EndIf}
+  ${If} $R9 == $EXEPATH
+    Return
+  ${EndIf}
+  IntOp $R3 $RestartManagerBatchCount * ${RESTART_MANAGER_PATH_BYTES}
+  IntOp $R3 $RestartManagerPathBuffer + $R3
+  System::Call 'kernel32::lstrcpyW(p R3, w R9)'
+  IntOp $R4 $RestartManagerBatchCount * ${NSIS_PTR_SIZE}
+  IntOp $R4 $RestartManagerPathArray + $R4
+  System::Call '*$R4(p R3)'
+  IntOp $RestartManagerBatchCount $RestartManagerBatchCount + 1
+  ${If} $RestartManagerBatchCount = ${RESTART_MANAGER_BATCH_SIZE}
+    Call FlushRestartManagerFiles
+  ${EndIf}
+FunctionEnd
+
+Function ValidateRestartManagerPath
+  StrCpy $RestartManagerStage "GetFileAttributesW"
+  StrCpy $RestartManagerResource $R9
+  System::Call 'kernel32::GetFileAttributesW(w R9) i .r0 ?e'
+  Pop $1
+  ${If} $0 = -1
+    StrCpy $RestartManagerError $1
+  ${Else}
+    IntOp $1 $0 & 0x400
+    ${If} $1 != 0
+      StrCpy $RestartManagerStage "Validate installation path (link/junction)"
+      StrCpy $RestartManagerError 50
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
+Function RegisterRestartManagerDirectory
+  Exch $R8
+  Push $R6
+  Push $R7
+  Push $R9
+  StrCpy $R9 $R8
+  StrCpy $R6 ""
+  Call ValidateRestartManagerPath
+  ${If} $RestartManagerError == 2
+  ${OrIf} $RestartManagerError == 3
+    StrCpy $RestartManagerError 0 ; Nothing installed yet.
+    Goto rm_directory_done
+  ${EndIf}
+  ${If} $RestartManagerError != 0
+    Goto rm_directory_done
+  ${EndIf}
+  StrCpy $RestartManagerStage "FindFirst"
+  ClearErrors
+  FindFirst $R6 $R7 "$R8\*"
+  ${If} ${Errors}
+    ; NSIS does not expose the underlying FindFirst Windows error.
+    StrCpy $RestartManagerError "error"
+    Goto rm_directory_done
+  ${EndIf}
+  rm_directory_next:
+    ${If} $R7 != "."
+    ${AndIf} $R7 != ".."
+      StrCpy $R9 "$R8\$R7"
+      Call ValidateRestartManagerPath
+      ${If} $RestartManagerError != 0
+        Goto rm_directory_done
+      ${EndIf}
+      IntOp $1 $0 & 0x10
+      ${If} $1 != 0
+        Push $R9
+        Call RegisterRestartManagerDirectory
+      ${Else}
+        Call ProbeRestartManagerFile
+      ${EndIf}
+      ${If} $RestartManagerError != 0
+        Goto rm_directory_done
+      ${EndIf}
+    ${EndIf}
+    ClearErrors
+    FindNext $R6 $R7
+    IfErrors rm_directory_done rm_directory_next
+  rm_directory_done:
+    ${If} $R6 != ""
+      FindClose $R6
+    ${EndIf}
+    Pop $R9
+    Pop $R7
+    Pop $R6
+    Pop $R8
+FunctionEnd
+
+Function QueryRestartManagerOccupiers
+  StrCpy $RestartManagerStage "RmGetList"
+  StrCpy $RestartManagerResource "$INSTDIR"
+  ; With no output array, 234 means the required process count is available.
+  ; System r1/r3 map to NSIS $1/$3, not $R1/$R3.
+  System::Call '"$SYSDIR\rstrtmgr.dll"::RmGetList(i $RestartManagerSession, *i .r1, *i 0, p 0, *i .r3) i .r0'
+  StrCpy $RestartManagerProcessCount $1
+  StrCpy $RestartManagerRebootReasons $3
+  StrCpy $RestartManagerError $0
+  ${If} $0 == 234
+    StrCpy $RestartManagerError 0
+  ${EndIf}
+FunctionEnd
+
+Function CloseInstallDirExecutablesWithRestartManager
+  StrCpy $RestartManagerSession ""
+  StrCpy $RestartManagerError 0
+  StrCpy $RestartManagerFileCount 0
+  StrCpy $RestartManagerBatchCount 0
+  StrCpy $RestartManagerProcessCount 0
+  StrCpy $RestartManagerRebootReasons 0
+  StrCpy $RestartManagerStage "Allocate native file buffers"
+  StrCpy $RestartManagerResource "$INSTDIR"
+  System::Alloc ${RESTART_MANAGER_BUFFER_BYTES}
+  Pop $RestartManagerPathBuffer
+  System::Alloc ${RESTART_MANAGER_ARRAY_BYTES}
+  Pop $RestartManagerPathArray
+  ${If} $RestartManagerPathBuffer = 0
+  ${OrIf} $RestartManagerPathArray = 0
+    StrCpy $RestartManagerError 14
+  ${Else}
+    Push "$INSTDIR"
+    Call RegisterRestartManagerDirectory
+    ${If} $RestartManagerError == 0
+      Call FlushRestartManagerFiles
+    ${EndIf}
+  ${EndIf}
+  System::Free $RestartManagerPathBuffer
+  System::Free $RestartManagerPathArray
+  ${If} $RestartManagerError == 0
+  ${AndIf} $RestartManagerSession != ""
+    Call QueryRestartManagerOccupiers
+    ${If} $RestartManagerError == 0
+      ${If} $RestartManagerRebootReasons != 0
+        StrCpy $RestartManagerStage "RmGetList (system restart required)"
+        StrCpy $RestartManagerError 3010
+      ${ElseIf} $RestartManagerProcessCount > 0
+        StrCpy $RestartManagerStage "RmShutdown"
+        ; Force mode already tries graceful shutdown before terminating
+        ; unresponsive applications. Do not restart closed applications.
+        System::Call '"$SYSDIR\rstrtmgr.dll"::RmShutdown(i $RestartManagerSession, i ${RmForceShutdown}, p 0) i .r0'
+        StrCpy $RestartManagerError $0
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $RestartManagerSession != ""
+    System::Call '"$SYSDIR\rstrtmgr.dll"::RmEndSession(i $RestartManagerSession) i .r0'
+    ${If} $RestartManagerError == 0
+    ${AndIf} $0 != 0
+      StrCpy $RestartManagerStage "RmEndSession"
+      StrCpy $RestartManagerError $0
+    ${EndIf}
+    StrCpy $RestartManagerSession ""
+  ${EndIf}
+FunctionEnd
+
+Function FormatRestartManagerError
+  ${If} $RestartManagerError == "error"
+    StrCpy $R0 "NSIS could not complete this step; Windows error code unavailable."
+  ${Else}
+    System::Call 'kernel32::FormatMessageW(i 0x1200, p 0, i $RestartManagerError, i 0, w .R0, i ${NSIS_MAX_STRLEN}, p 0) i .r0'
+    ${If} $0 = 0
+      StrCpy $R0 "Windows could not provide an error description."
+    ${EndIf}
+  ${EndIf}
+  ; Bound each field so NSIS's string limit cannot hide the later fields.
+  StrCpy $R2 $R0 256
+  StrCpy $R3 $RestartManagerResource 256
+  ${If} $LANGUAGE == 2052
+    StrCpy $RestartManagerMessage "安装文件检查失败。$\r$\n步骤：$RestartManagerStage$\r$\n错误：$RestartManagerError — $R2$\r$\n路径：$R3$\r$\n占用进程：$RestartManagerProcessCount$\r$\n重启原因：$RestartManagerRebootReasons"
+  ${Else}
+    StrCpy $RestartManagerMessage "Installation file check failed.$\r$\nStep: $RestartManagerStage$\r$\nError: $RestartManagerError — $R2$\r$\nPath: $R3$\r$\nOccupiers: $RestartManagerProcessCount$\r$\nReboot reasons: $RestartManagerRebootReasons"
+  ${EndIf}
+FunctionEnd
+
+Function KillInstallDirExecutables
+  retry_kill_install_dir_executables:
+    Call CloseInstallDirExecutablesWithRestartManager
+    ${If} $RestartManagerError == 0
+      Return
+    ${EndIf}
+    Call FormatRestartManagerError
+    DetailPrint "$RestartManagerMessage"
+    ${If} ${Silent}
+      ${If} $RestartManagerError == "error"
+        SetErrorLevel 1
+      ${Else}
+        SetErrorLevel $RestartManagerError
+      ${EndIf}
+      Abort
+    ${EndIf}
+    MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "$RestartManagerMessage" IDRETRY retry_kill_install_dir_executables
+    Abort
+FunctionEnd
+; END INSTALLER RESTART MANAGER FUNCTIONS
 
 Function RestorePreviousInstallLocation
   ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""

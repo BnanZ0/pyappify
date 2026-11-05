@@ -156,8 +156,16 @@ pub(crate) async fn setup_git_from_mirror(
         let mut updated = previous.clone();
         load_app_details(&mut updated).await?;
         updated.current_profile = final_profile;
-        (updated.current_version, updated.current_version_missing) =
-            resolve_current_version_state(None, &versions, current);
+        if let Some(version) = version {
+            if !versions.iter().any(|available| available == version) {
+                bail!("Requested version '{}' is no longer available", version);
+            }
+            updated.current_version = Some(version.to_string());
+            updated.current_version_missing = false;
+        } else {
+            (updated.current_version, updated.current_version_missing) =
+                resolve_current_version_state(None, &versions, current);
+        }
         updated.available_versions = versions;
         updated.installed = true;
         updated.source_operation_kind = crate::extensions::cancellation::current_kind(app_name);

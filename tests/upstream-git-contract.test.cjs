@@ -95,12 +95,12 @@ test('Pip retry is consumed only after pip succeeds, before the app is dispatche
 });
 
 test('Extracted setup retains the original copy, YAML, profile, Python and pip sequence', () => {
-    const native = body(base, 'setup_app');
+    const native = body(base, 'setup_app_at_version');
     const expected = native.slice(native.indexOf('    let working_dir_path'), native.indexOf('    let mut app_guard = APP.lock().await;'));
     const helper = body(current, 'setup_git_files_from_repository');
     const actual = helper.slice(helper.indexOf('    let working_dir_path'), helper.indexOf('    Ok(final_profile_name_to_set)'));
     assert.equal(withoutCancellation(actual), tokens(expected));
-    const operation = body(read('src-tauri/src/extensions/setup.rs'), 'setup_app');
+    const operation = body(read('src-tauri/src/extensions/setup.rs'), 'setup_app_with_version');
     assert.ok(operation.includes('app_dir_lock.lock().await'));
     assert.ok(operation.includes('operation.finish(&result)'));
 });
@@ -119,8 +119,8 @@ test('Optional root YAML override and embedded fallback equal upstream/HEAD', ()
 
 test('Git install keeps its version refresh inside the task; refresh rejects changed task identity', () => {
     const setup = body(current, 'setup_git_app');
-    assert.ok(setup.includes('update_app_from_disk().await?'));
-    const refresh = body(current, 'update_app_from_disk');
+    assert.ok(setup.includes('update_app_from_disk_at_version(version).await?'));
+    const refresh = body(current, 'update_app_from_disk_at_version');
     assert.ok(refresh.includes('let querying_operation = cancellation::current_id(&app.name);'));
     assert.ok(refresh.includes('cancellation::current_id(&app.name) != querying_operation'));
     assert.ok(!refresh.includes('cancellation::current_kind(&app.name).is_some()'));

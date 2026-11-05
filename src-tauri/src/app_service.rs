@@ -1808,6 +1808,7 @@ async fn check_running_on_start(app_name: &str) -> Result<bool> {
     Ok(is_running_after_timeout)
 }
 
+#[allow(dead_code)]
 async fn build_app_shortcut_command(
     app_name: &str,
     profile: &Profile,
@@ -1831,6 +1832,10 @@ async fn build_app_shortcut_command(
     } else {
         Ok((script_path, None))
     }
+}
+
+fn build_launcher_shortcut_command() -> Result<(PathBuf, Option<String>)> {
+    Ok((std::env::current_exe()?, Some("-c start".to_string())))
 }
 
 fn build_app_shortcut_bootstrap(
@@ -2088,14 +2093,11 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
                 "No Windows-compatible app icon was found; the shortcut will use the target executable icon."
             );
         }
-        let (shortcut_target, shortcut_arguments) =
-            match build_app_shortcut_command(&app_name, &profile_to_run_with, &working_dir).await {
-                Ok(command) => command,
-                Err(error) => {
-                    emit_error!(app_name, "Failed to prepare the app shortcut: {}", error);
-                    return Err(error.into());
-                }
-            };
+        let (shortcut_target, shortcut_arguments) = build_launcher_shortcut_command()?;
+        let shortcut_working_dir = shortcut_target
+            .parent()
+            .context("The launcher executable has no parent directory")?
+            .to_path_buf();
         emit_info!(
             app_name,
             "Shortcut target: {} (arguments: {:?}, icon: {:?}, run as admin: {})",
@@ -2109,7 +2111,7 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
             app_name.clone(),
             shortcut_target,
             shortcut_arguments,
-            working_dir,
+            shortcut_working_dir,
             icon_path,
             profile_to_run_with.is_admin(),
         )

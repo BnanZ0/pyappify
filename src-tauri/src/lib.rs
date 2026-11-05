@@ -20,7 +20,7 @@ use crate::app::{
 };
 use crate::app_service::{
     cancel_app_operation, delete_app, get_app_icon, get_update_notes, get_version_list, load_app,
-    set_startup_overrides, setup_app, start_app, stop_app, update_app_preferences,
+    set_startup_overrides, start_app, stop_app, update_app_preferences,
     update_to_version, StartupOverrides, AUTO_START_CHECKED,
 };
 use crate::config_manager::{
@@ -363,7 +363,7 @@ async fn handle_command_line(options: CommandLineOptions) {
                 "Command-line mode: Setting up app '{}' with profile '{}'.",
                 app_name, p_name
             );
-            match setup_app(app_name, &p_name, None).await {
+            match extensions::setup::setup_app(app_name, &p_name, None).await {
                 Ok(()) => {
                     println!("Setup successful.");
                     std::process::exit(0);
@@ -703,7 +703,7 @@ pub async fn run() {
                 cancel_app_operation,
                 load_app,
                 get_app_icon,
-                setup_app,
+                extensions::setup::setup_app,
                 delete_app,
                 get_update_notes,
                 update_to_version,

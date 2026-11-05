@@ -1161,56 +1161,7 @@ pub(crate) async fn setup_git_files_from_repository(
     Ok(final_profile_name_to_set)
 }
 
-#[tauri::command]
-pub async fn setup_app(
-    app_name: &str,
-    profile_name: &str,
-    operation_id: Option<String>,
-) -> Result<(), Error> {
-    let app_dir_lock = get_app_lock(app_name).await?;
-    let _guard = app_dir_lock.lock().await;
-    let app = get_app_by_name(app_name).await?;
-    ensure_app_stopped_for_update(app_name).await?;
-    use cancellation::OperationKind::*;
-    let kind = match (app.update_source, app.installed, app.installed_source()) {
-        (UpdateSource::Mirrorchyan, true, UpdateSource::Mirrorchyan) => MirrorConfigure,
-        (UpdateSource::Mirrorchyan, _, _) => MirrorInstall,
-        (_, true, UpdateSource::Git) => GitConfigure,
-        _ => GitInstall,
-    };
-    let mut operation = cancellation::AppOperationCancellationGuard::start(
-        app_name,
-        kind,
-        operation_id,
-        None,
-        Some(profile_name.into()),
-        app.current_version.clone(),
-    );
-    let result = setup_app_body(app_name, profile_name, app)
-        .await
-        .map_err(|error| {
-            if cancellation::is_cancelled(&error) {
-                Error::Cancelled
-            } else {
-                error
-            }
-        });
-    operation.finish(&result);
-    result
-}
-
-async fn setup_app_body(app_name: &str, profile_name: &str, app: App) -> Result<(), Error> {
-    if app.update_source == UpdateSource::Mirrorchyan {
-        return crate::mirror::service::setup(app_name, profile_name, app).await;
-    }
-
-    if app
-        .installation
-        .as_ref()
-        .is_some_and(|record| record.source == UpdateSource::Mirrorchyan)
-    {
-        return crate::source_switch::setup_git_from_mirror(app_name, profile_name, None).await;
-    }
+pub(crate) async fn setup_git_app(app_name: &str, profile_name: &str) -> Result<(), Error> {
     let final_profile_name_to_set = setup_git_files(app_name, profile_name).await?;
     cancellation::begin_commit()?;
 

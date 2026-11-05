@@ -100,8 +100,9 @@ test('Extracted setup retains the original copy, YAML, profile, Python and pip s
     const helper = body(current, 'setup_git_files_from_repository');
     const actual = helper.slice(helper.indexOf('    let working_dir_path'), helper.indexOf('    Ok(final_profile_name_to_set)'));
     assert.equal(withoutCancellation(actual), tokens(expected));
-    assert.ok(body(current, 'setup_app').includes('app_dir_lock.lock().await'));
-    assert.ok(body(current, 'setup_app').includes('operation.finish(&result)'));
+    const operation = body(read('src-tauri/src/extensions/setup.rs'), 'setup_app');
+    assert.ok(operation.includes('app_dir_lock.lock().await'));
+    assert.ok(operation.includes('operation.finish(&result)'));
 });
 
 test('Native update state and failure/retry wrapper remain after the source dispatch', () => {
@@ -117,7 +118,7 @@ test('Optional root YAML override and embedded fallback equal upstream/HEAD', ()
 });
 
 test('Git install keeps its version refresh inside the task; refresh rejects changed task identity', () => {
-    const setup = body(current, 'setup_app_body');
+    const setup = body(current, 'setup_git_app');
     assert.ok(setup.includes('update_app_from_disk().await?'));
     const refresh = body(current, 'update_app_from_disk');
     assert.ok(refresh.includes('let querying_operation = cancellation::current_id(&app.name);'));

@@ -292,18 +292,6 @@ async fn rollback_interrupted_pip_sync_on_startup(app: &mut App, repo_path: &Pat
         previous_version
     );
 
-    update_working_from_repo(&app.name).await?;
-    if marker_path.exists() {
-        if let Err(e) = fs::remove_file(&marker_path) {
-            warn!(
-                "Rollback for '{}' completed, but failed to remove marker {}: {}",
-                app.name,
-                marker_path.display(),
-                e
-            );
-        }
-    }
-
     load_app_details(app);
     app.current_version = Some(previous_version.clone());
     emit_info!(
@@ -1367,7 +1355,12 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
 
     let spec_changed = old_requirements_spec != new_requirements_spec;
     let content_changed = old_content != new_content;
-    let needs_pip_sync = !new_requirements_spec.is_empty() && (spec_changed || content_changed);
+    let needs_pip_sync = !new_requirements_spec.is_empty()
+        && (spec_changed
+            || content_changed
+            || working_dir_path
+                .join(python_env::PIP_UPDATE_NEEDED_MARKER)
+                .try_exists()?);
 
     if needs_pip_sync {
         if spec_changed {
@@ -1377,7 +1370,7 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
                 old_requirements_spec,
                 new_requirements_spec
             );
-        } else {
+        } else if content_changed {
             let file_type = if new_requirements_spec.ends_with(".txt") {
                 &new_requirements_spec
             } else {
@@ -2027,6 +2020,78 @@ pub async fn periodically_update_app_running_status(app_handle: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pip_retry_marker_survives_git_rollback_and_startup_recovery() {
+        let app_name = format!(
+            "pip-retry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = crate::utils::path::get_app_base_path(&app_name);
+        let repo_path = crate::utils::path::get_app_repo_path(&app_name);
+        let working = crate::utils::path::get_app_working_dir_path(&app_name);
+        std::fs::create_dir_all(&working).unwrap();
+        {
+            let repo = git2::Repository::init(&repo_path).unwrap();
+            std::fs::write(repo_path.join("requirements.txt"), "old dependencies").unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new("requirements.txt"))
+                .unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+            let oid = repo
+                .commit(Some("HEAD"), &signature, &signature, "old body", &tree, &[])
+                .unwrap();
+            repo.tag_lightweight("v1.0.0", &repo.find_object(oid, None).unwrap(), false)
+                .unwrap();
+        }
+        crate::git::ensure_bare_layout(&app_name, &repo_path).await.unwrap();
+        let marker = working.join(crate::python_env::PIP_UPDATE_NEEDED_MARKER);
+        std::fs::write(&marker, "").unwrap();
+        std::fs::write(working.join("requirements.txt"), "new dependencies").unwrap();
+        std::fs::write(working.join("extra.txt"), "not in repo").unwrap();
+        super::rollback_to_previous_version(&app_name, &repo_path, "v1.0.0", None, "pip cancelled")
+            .await
+            .unwrap();
+        assert!(marker.is_file());
+        assert_eq!(
+            std::fs::read_to_string(working.join("requirements.txt")).unwrap(),
+            "old dependencies"
+        );
+        assert_eq!(std::fs::read_to_string(working.join("extra.txt")).unwrap(), "not in repo");
+
+        let mut app: crate::app::App =
+            serde_yaml::from_str("name: fixture\nprofiles: []\n").unwrap();
+        app.name = app_name.clone();
+        app.installed = true;
+        app.current_version = Some("v1.0.0".into());
+        for _ in 0..2 {
+            super::rollback_interrupted_pip_sync_on_startup(&mut app, &repo_path)
+                .await
+                .unwrap();
+            assert!(
+                marker.is_file(),
+                "startup recovery must leave pip retry pending"
+            );
+            assert_eq!(app.update_state, crate::app::AppUpdateState::Idle);
+        }
+        // A failed synchronization must not consume the pending retry either.
+        let backup = repo_path.with_file_name("repo-backup");
+        std::fs::rename(&repo_path, &backup).unwrap();
+        assert!(super::update_working_from_repo(&app_name).await.is_err());
+        assert!(marker.is_file());
+        std::fs::rename(&backup, &repo_path).unwrap();
+        // Once pip succeeds and consumes its marker, source sync must not recreate it.
+        std::fs::remove_file(&marker).unwrap();
+        super::update_working_from_repo(&app_name).await.unwrap();
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::{
         backup_invalid_app_config, build_app_shortcut_bootstrap,
         build_python_execution_environment, get_update_target, icon_mime_type,

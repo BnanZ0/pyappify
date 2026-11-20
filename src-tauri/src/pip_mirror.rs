@@ -141,6 +141,7 @@ pub async fn pip_has_index_config(python_exe: &Path) -> bool {
     }
     let mut command = new_cmd(python_exe);
     command
+        .kill_on_drop(true)
         .args(["-m", "pip", "config", "list"])
         .clear_python_envs()
         .env_remove("PIP_INDEX_URL")

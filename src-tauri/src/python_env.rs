@@ -524,10 +524,7 @@ pub async fn install_requirements(
     });
     let mut index_url = if explicit_index { None } else { pip_index_url };
     let mut automatic = false;
-    if !explicit_index
-        && index_url.is_none()
-        && !pip_mirror::pip_has_index_config(&python_exe).await
-    {
+    if !explicit_index && index_url.is_none() && !pip_mirror::pip_has_index_config(&python_exe).await {
         index_url = pip_mirror::auto_url(app_name).await;
         automatic = index_url.is_some();
     }
@@ -557,8 +554,14 @@ pub async fn install_requirements(
         pip_install_cmd
     };
 
+    cancellation::ensure_app_operation_not_cancelled()?;
     let marker_path = project_dir.join(PIP_UPDATE_NEEDED_MARKER);
-    fs::File::create(&marker_path).ok();
+    fs::File::create(&marker_path).with_context(|| {
+        format!(
+            "Failed to create pip retry marker {}",
+            marker_path.display()
+        )
+    })?;
 
     let mut result = run_pip_install(
         build_pip_install_cmd(index_url.as_deref()),
@@ -567,7 +570,10 @@ pub async fn install_requirements(
         index_url.as_deref(),
     )
     .await;
-    if result.is_err() && automatic {
+    if automatic
+        && !cancellation::app_operation_cancelled()
+        && result.as_ref().is_err_and(|error| !cancellation::is_cancelled(error))
+    {
         emit_info!(
             app_name,
             "pip install with {} failed; retrying with pip's default index",
@@ -577,9 +583,15 @@ pub async fn install_requirements(
         result = run_pip_install(build_pip_install_cmd(None), app_name, &pip_install_desc, None).await;
     }
     result?;
+    cancellation::begin_commit()?;
 
-    if marker_path.exists() {
-        let _ = fs::remove_file(&marker_path);
+    if marker_path.try_exists()? {
+        fs::remove_file(&marker_path).with_context(|| {
+            format!(
+                "Failed to remove pip retry marker {}",
+                marker_path.display()
+            )
+        })?;
     }
 
     clean_python_install(app_name, get_python_dir(app_name).as_ref())?;
@@ -610,6 +622,7 @@ async fn run_pip_install(
     .await
     {
         Ok(_) => Ok(()),
+        Err(error) if cancellation::is_cancelled(&error) => Err(error),
         Err(error) => {
             let pip_output = output.lock().unwrap().clone();
             if !pip_mirror::is_network_error(&pip_output) {

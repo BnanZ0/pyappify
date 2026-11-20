@@ -1,3 +1,4 @@
+use crate::extensions::cancellation;
 // src/python_env.rs
 use crate::config_manager::get_default_locale;
 use crate::utils::command::new_cmd;
@@ -127,6 +128,12 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
 
     let download_result = match download_file(&primary_url, &archive_path, app_name).await {
         Ok(()) => Ok(()),
+        Err(e)
+            if e.downcast_ref::<Error>()
+                .is_some_and(cancellation::is_cancelled) =>
+        {
+            Err(e)
+        }
         Err(e) => {
             warn!(
                 "Download from primary URL {} failed: {:#}. Trying backup URL: {}",
@@ -157,7 +164,12 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
         archive_path.display(),
         install_dir.display()
     );
-    let extract_result = extract_archive(&archive_path, &install_dir);
+    let extract_result = (|| -> Result<()> {
+        cancellation::ensure_app_operation_not_cancelled()?;
+        extract_archive(&archive_path, &install_dir)?;
+        cancellation::ensure_app_operation_not_cancelled()?;
+        Ok(())
+    })();
     // The archive is only needed for extraction, whatever the outcome.
     remove_path_logged(&archive_path);
     if let Err(extract_err) = extract_result {
@@ -377,17 +389,17 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
         client_builder = client_builder.user_agent(get_user_agent());
     }
     let client = client_builder.build()?;
-    let response = client
-        .get(url)
-        .send()
-        .await
+    let response = cancellation::wait(app_name, client.get(url).send())
+        .await?
         .with_context(|| format!("Failed to initiate download from {}", url))?;
 
     let status = response.status();
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_else(|_| {
-            String::from("(could not retrieve error body from non-success response)")
-        });
+        let error_body = cancellation::wait(app_name, response.text())
+            .await?
+            .unwrap_or_else(|_| {
+                String::from("(could not retrieve error body from non-success response)")
+            });
         return Err(anyhow!(
             "Download from {} failed: Status {} {}",
             url,
@@ -409,7 +421,9 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
     let mut last_reported_percent: i64 = -1;
 
     let mut stream = response.bytes_stream();
-    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+    while let Some(item) =
+        cancellation::wait(app_name, futures_util::StreamExt::next(&mut stream)).await?
+    {
         let chunk =
             item.with_context(|| format!("Failed to read chunk from download stream of {}", url))?;
         file.write_all(&chunk)

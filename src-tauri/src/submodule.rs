@@ -1,4 +1,5 @@
 use crate::emit_info;
+use crate::extensions::cancellation;
 use crate::utils::path::relative_path;
 use anyhow::{Context, Result};
 use git2::{build::CheckoutBuilder, Repository, SubmoduleUpdateOptions};
@@ -31,15 +32,22 @@ pub fn update_repository_submodules(
             checkout.force();
             let mut options = SubmoduleUpdateOptions::new();
             options.checkout(checkout);
-            submodule
-                .update(true, Some(&mut options))
-                .with_context(|| {
+            if let Some(token) = cancellation::current_token(app_name) {
+                token.check()?;
+                let mut callbacks = git2::RemoteCallbacks::new();
+                callbacks.transfer_progress(move |_| token.git_progress());
+                let mut fetch = git2::FetchOptions::new();
+                fetch.remote_callbacks(callbacks);
+                options.fetch(fetch);
+            }
+            let result = submodule.update(true, Some(&mut options)).with_context(|| {
                     format!(
                         "Failed to update submodule '{}' for {}",
                         submodule.name().unwrap_or("<unknown>"),
                         context_message
                     )
-                })?;
+                });
+            cancellation::git_result(app_name, result)?;
             emit_info!(
                 app_name,
                 "Successfully updated submodule: {} for {}",

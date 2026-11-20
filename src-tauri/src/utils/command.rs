@@ -14,7 +14,7 @@ pub async fn run_command_and_stream_output(
     app_name: &str,
     command_description: &str,
 ) -> Result<ExitStatus, Error> {
-    run_command(command, app_name, command_description, None).await
+    run_command(command, app_name, command_description, None, None).await
 }
 
 /// Like `run_command_and_stream_output`, also appending stdout and stderr to `output`.
@@ -24,7 +24,8 @@ pub async fn run_command_and_capture_output(
     command_description: &str,
     output: Arc<Mutex<String>>,
 ) -> Result<ExitStatus, Error> {
-    run_command(command, app_name, command_description, Some(output)).await
+    let token = crate::extensions::cancellation::current_token(app_name);
+    run_command(command, app_name, command_description, Some(output), token).await
 }
 
 async fn run_command(
@@ -32,6 +33,7 @@ async fn run_command(
     app_name: &str,
     command_description: &str,
     output: Option<Arc<Mutex<String>>>,
+    token: Option<Arc<crate::extensions::cancellation::Cancellation>>,
 ) -> Result<ExitStatus, Error> {
     emit_info!(
         app_name,
@@ -40,7 +42,18 @@ async fn run_command(
         command
     );
 
-    command.creation_flags(0x08000000);
+    if let Some(token) = &token {
+        token.check()?;
+    }
+    let job = token
+        .as_ref()
+        .map(|_| crate::extensions::process_job::ProcessJob::new())
+        .transpose()?;
+    command.creation_flags(if job.is_some() {
+        0x08000000 | 0x00000004
+    } else {
+        0x08000000
+    });
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
@@ -50,6 +63,20 @@ async fn run_command(
         err!(msg)
     })?;
 
+    if let Some(job) = &job {
+        if let Err(error) = job.attach_and_resume(&child) {
+            // Assignment/resume failure must not leave a suspended writer alive.
+            let stop = child.kill().await;
+            let _ = child.wait().await;
+            stop?;
+            return Err(error.into());
+        }
+    }
+    let operation_id = token
+        .as_ref()
+        .and_then(|_| crate::extensions::cancellation::current_id(app_name));
+    let stdout_operation = operation_id.clone();
+    let stderr_operation = operation_id;
     let child_pid = child
         .id()
         .map(|id| id.to_string())
@@ -90,7 +117,13 @@ async fn run_command(
                     if let Some(output) = &output_for_stdout {
                         output.lock().unwrap().push_str(&buffer);
                     }
-                    emit_info!(app_name_for_stdout, "{}", buffer.as_str());
+                    crate::emitter::emit_log_for_operation(
+                        app_name_for_stdout.clone(),
+                        buffer.as_str(),
+                        false,
+                        false,
+                        stdout_operation.clone(),
+                    );
                     buffer.clear();
                 }
                 Err(e) => {
@@ -117,7 +150,13 @@ async fn run_command(
                         && !err_string.contains("A new release of pip is available")
                         && !err_string.contains("[notice] To update, run")
                     {
-                        emit_error!(app_name_for_stderr, "{}", err_string);
+                        crate::emitter::emit_log_for_operation(
+                            app_name_for_stderr.clone(),
+                            &err_string,
+                            false,
+                            true,
+                            stderr_operation.clone(),
+                        );
                     } else {
                         debug!("not emitting black listed stderr {}", err_string);
                     }
@@ -130,12 +169,56 @@ async fn run_command(
         }
     });
 
-    let status = child.wait().await?;
+    // Keep cancellation active until descendants have exited, even after pip exits.
+    // Complete the process wait before draining both streams and returning a result.
+    let result = async {
+        let Some(token) = &token else {
+            return child.wait().await.map_err(Error::from);
+        };
+        let job = job.as_ref().expect("cancellable command has a job");
+        let mut cancelled = false;
+        let mut termination_error = None;
+        let status = tokio::select! { biased;
+            _ = token.cancelled() => {
+                cancelled = true;
+                termination_error = job.terminate().err();
+                if termination_error.is_some() { let _ = child.kill().await; }
+                child.wait().await
+            }
+            status = child.wait() => status,
+        };
+        let failed_before_cancel =
+            !cancelled && status.as_ref().is_ok_and(|status| !status.success());
+        if cancelled {
+            job.wait_empty().await?;
+        } else {
+            tokio::select! { biased;
+                _ = token.cancelled() => {
+                    cancelled = true;
+                    termination_error = job.terminate().err();
+                    job.wait_empty().await?;
+                }
+                result = job.wait_empty() => result?,
+            }
+        }
+        let status = status?;
+        if let Some(error) = termination_error {
+            return Err(Error::Io(error));
+        }
+        // An already observed command failure remains a failure during cancellation.
+        if !cancelled || failed_before_cancel {
+            return Ok(status);
+        }
+        Err(Error::Cancelled)
+    }
+    .await;
 
-    if let Err(e) = tokio::try_join!(stdout_task, stderr_task) {
+    let (stdout_result, stderr_result) = tokio::join!(stdout_task, stderr_task);
+    if let Some(e) = stdout_result.err().or_else(|| stderr_result.err()) {
         error!(error = %e, cmd_desc = %command_description, "Log reading task encountered an error. This does not necessarily mean the command itself failed.");
     }
 
+    let status = result?;
     if !status.success() {
         return Err(err!("Command failed ({}): {}", command_description, status));
     }

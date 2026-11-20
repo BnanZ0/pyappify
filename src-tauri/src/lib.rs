@@ -5,6 +5,7 @@ mod changelog;
 mod config_manager;
 mod emitter;
 mod execute_python;
+pub mod extensions;
 mod git;
 mod pip_mirror;
 mod python_env;

@@ -802,7 +802,7 @@ pub async fn get_update_notes(app_name: String, version: String) -> Result<Vec<S
     let _guard = app_lock.lock().await;
     let app = get_app_by_name(&app_name).await?;
     let messages =
-        git::get_commit_messages_for_version_diff(&app.get_repo_path(), &version, get_locale())
+        git::get_commit_messages_for_version_diff(&app.name, &app.get_repo_path(), &version, get_locale())
             .await?;
     info!(
         "get_update_notes for {} version {} messages: {:?}",
@@ -1302,6 +1302,7 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
         Vec::new()
     } else {
         match git::get_commit_messages_for_version_diff(
+            app_name,
             &path::get_app_repo_path(app_name),
             version,
             get_locale(),

@@ -1,5 +1,6 @@
 //git.rs
 use crate::changelog;
+use crate::extensions::cancellation;
 use crate::utils::path::get_working_dir_for_repo;
 use crate::{app::App, emit_info, emit_update_info, submodule};
 use anyhow::{Context, Result};
@@ -326,6 +327,7 @@ fn fetch_from_origin(
     all_tags: bool,
     progress_prefix: Option<&str>,
 ) -> Result<()> {
+    cancellation::ensure_app_operation_not_cancelled()?;
     let mut remote = repo
         .find_remote("origin")
         .context("Failed to find remote 'origin'")?;
@@ -338,6 +340,8 @@ fn fetch_from_origin(
             prefix,
             false,
         ));
+    } else if let Some(token) = cancellation::current_token(app_name) {
+        callbacks.transfer_progress(move |_| token.git_progress());
     }
     let mut fetch_options = create_fetch_options(callbacks, depth, all_tags);
     fetch_options.prune(git2::FetchPrune::On);
@@ -354,7 +358,7 @@ fn fetch_from_origin(
     if progress_prefix.is_some() {
         emit_update_info!(app_name, "");
     }
-    result
+    cancellation::git_result(app_name, result)
 }
 
 fn tag_refspec(tag: &str) -> String {
@@ -591,6 +595,7 @@ fn clone_kept_releases(
                 )
             };
             if let Err(error) = fetch() {
+                cancellation::ensure_app_operation_not_cancelled()?;
                 warn!("Fetching {} failed, retrying once: {:#}", refspec, error);
                 fetch()?;
             }
@@ -618,9 +623,13 @@ fn create_transfer_progress_callback(
     prefix: &str,
     detailed: bool,
 ) -> impl FnMut(Progress<'_>) -> bool + 'static {
+    let token = cancellation::current_token(&app_name);
     let prefix = prefix.to_string();
     let mut last_percent = -1.0;
     move |progress: Progress| {
+        if token.as_ref().is_some_and(|token| !token.git_progress()) {
+            return false;
+        }
         let received_objects = progress.received_objects();
         let total_objects = progress.total_objects();
         let detail = if detailed {
@@ -1322,6 +1331,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 pub async fn ensure_repository(app: &App) -> Result<()> {
+    cancellation::ensure_app_operation_not_cancelled()?;
     let repo_path = app.get_repo_path();
     ensure_bare_layout(&app.name, &repo_path).await?;
     let _guard = lock_repo(&repo_path).await;
@@ -1448,12 +1458,14 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
             let mut builder = git2::build::RepoBuilder::new();
             builder.fetch_options(fetch_options);
             builder.bare(true);
-            drop(
+            cancellation::git_result(
+                &app_name_for_messages,
                 builder
                     .clone(&url_for_clone_task, &repo_path_for_clone_task)
-                    .with_context(|| format!("Git clone failed for {}", url_for_clone_task))?,
-            );
+                    .with_context(|| format!("Git clone failed for {}", url_for_clone_task)),
+            )?;
         }
+        cancellation::ensure_app_operation_not_cancelled()?;
         let repo = open_repository(&repo_path_for_clone_task)?;
         set_keep_releases(&repo, keep)?;
 
@@ -1541,9 +1553,11 @@ pub async fn checkout_version_tag(
         {
             if !is_local_only(&repo)? {
                 if let Err(error) = fetch_default_branch(&repo, &app_name_for_task) {
+                    cancellation::ensure_app_operation_not_cancelled()?;
                     warn!("Failed to fetch the default branch: {error:#}");
                 }
             }
+            cancellation::ensure_app_operation_not_cancelled()?;
             let obj = repo
                 .revparse_single(&tag_to_checkout)
                 .and_then(|obj| obj.peel(ObjectType::Commit))
@@ -1601,6 +1615,7 @@ pub async fn checkout_version_tag(
 
             debug!("Fetch successful for tag {}", tag_to_checkout);
         }
+        cancellation::ensure_app_operation_not_cancelled()?;
 
         let obj = repo
             .revparse_single(&format!("refs/tags/{}", tag_to_checkout))
@@ -1772,12 +1787,14 @@ fn commit_notes_for_update(
 /// Notes for updating the checkout to `target_version_tag_name`, in `language`
 /// when the app's changelogs have them, else commit messages.
 pub async fn get_commit_messages_for_version_diff(
+    app_name: &str,
     repo_path: &Path,
     target_version_tag_name: &str,
     language: &str,
 ) -> Result<Vec<String>> {
     let _guard = lock_repo(repo_path).await;
 
+    let app_name = app_name.to_string();
     let repo_path_clone = repo_path.to_path_buf();
     let target_tag = target_version_tag_name.to_string();
     let language = language.to_string();
@@ -1796,7 +1813,7 @@ pub async fn get_commit_messages_for_version_diff(
             if repo.find_reference(&target_tag_ref).is_err() && !is_local_only(&repo)? {
                 fetch_from_origin(
                     &repo,
-                    "",
+                    &app_name,
                     &[tag_refspec(&target_tag)],
                     None,
                     keep_releases(&repo).is_none(),
@@ -2515,7 +2532,7 @@ mod tests {
 
         checkout_version_tag("test", &repo_path, "v1.0.0").await.unwrap();
         assert_eq!(
-            super::get_commit_messages_for_version_diff(&repo_path, &next_commit[..7], "en")
+            super::get_commit_messages_for_version_diff("test", &repo_path, &next_commit[..7], "en")
                 .await
                 .unwrap(),
             vec!["next release"]

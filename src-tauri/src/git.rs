@@ -1539,8 +1539,10 @@ pub async fn checkout_version_tag(
                 .find_reference(&format!("refs/tags/{tag_to_checkout}"))
                 .is_err()
         {
-            if let Err(error) = fetch_default_branch(&repo, &app_name_for_task) {
-                warn!("Failed to fetch the default branch: {error:#}");
+            if !is_local_only(&repo)? {
+                if let Err(error) = fetch_default_branch(&repo, &app_name_for_task) {
+                    warn!("Failed to fetch the default branch: {error:#}");
+                }
             }
             let obj = repo
                 .revparse_single(&tag_to_checkout)
@@ -1572,31 +1574,33 @@ pub async fn checkout_version_tag(
             return Ok(commit_oid);
         }
 
-        let refspec = tag_refspec(&tag_to_checkout);
-        emit_info!(
-            app_name_for_task,
-            "Fetching refspec: {} for repo: {}",
-            refspec,
-            task_repo_path.display()
-        );
-        fetch_from_origin(
-            &repo,
-            &app_name_for_task,
-            &[refspec],
-            None,
-            keep_releases(&repo).is_none(),
-            Some("Fetching objects for tag"),
-        )
-        .with_context(|| {
-            format!(
-                "Failed to fetch tag {} for repo {}",
-                tag_to_checkout,
+        if !is_local_only(&repo)? {
+            let refspec = tag_refspec(&tag_to_checkout);
+            emit_info!(
+                app_name_for_task,
+                "Fetching refspec: {} for repo: {}",
+                refspec,
                 task_repo_path.display()
+            );
+            fetch_from_origin(
+                &repo,
+                &app_name_for_task,
+                &[refspec],
+                None,
+                keep_releases(&repo).is_none(),
+                Some("Fetching objects for tag"),
             )
-        })?;
-        prune_tags(&repo, &app_name_for_task, Some(&tag_to_checkout))?;
+            .with_context(|| {
+                format!(
+                    "Failed to fetch tag {} for repo {}",
+                    tag_to_checkout,
+                    task_repo_path.display()
+                )
+            })?;
+            prune_tags(&repo, &app_name_for_task, Some(&tag_to_checkout))?;
 
-        debug!("Fetch successful for tag {}", tag_to_checkout);
+            debug!("Fetch successful for tag {}", tag_to_checkout);
+        }
 
         let obj = repo
             .revparse_single(&format!("refs/tags/{}", tag_to_checkout))
@@ -1783,34 +1787,25 @@ pub async fn get_commit_messages_for_version_diff(
         let head_ref = repo.head().context("Failed to get repo HEAD")?;
         let head_oid = head_ref.target().context("HEAD has no target OID")?;
 
-        let target_tag_ref_str = format!("refs/tags/{}", target_tag);
-        if repo.find_reference(&target_tag_ref_str).is_err() {
-            debug!(
-                "Fetching target tag {} as it's not found locally.",
-                target_tag
-            );
-            fetch_from_origin(
-                &repo,
-                "",
-                &[tag_refspec(&target_tag)],
-                None,
-                keep_releases(&repo).is_none(),
-                None,
-            )
-            .with_context(|| format!("Failed to fetch target version tag {}", target_tag))?;
-        }
-
-        let target_obj = repo.revparse_single(&target_tag_ref_str).with_context(|| {
-            format!(
-                "Target version tag '{}' not found locally after potential fetch",
-                target_tag
-            )
-        })?;
-
-        let target_commit_oid = target_obj
-            .peel_to_commit()
-            .with_context(|| format!("Failed to peel tag '{}' to a commit object", target_tag))?
-            .id();
+        let target_tag_ref = format!("refs/tags/{target_tag}");
+        let target_commit_oid = if is_commit_version(&target_tag)
+            && repo.find_reference(&target_tag_ref).is_err()
+        {
+            repo.revparse_single(&target_tag)?.peel_to_commit()?.id()
+        } else {
+            if repo.find_reference(&target_tag_ref).is_err() && !is_local_only(&repo)? {
+                fetch_from_origin(
+                    &repo,
+                    "",
+                    &[tag_refspec(&target_tag)],
+                    None,
+                    keep_releases(&repo).is_none(),
+                    None,
+                )
+                .with_context(|| format!("Failed to fetch target version tag {}", target_tag))?;
+            }
+            resolve_tag_commit(&repo, &target_tag)?
+        };
 
         let tags_by_commit = version_tags_by_commit(&repo)?;
         let (notes, localized) = notes_in_language(
@@ -2503,5 +2498,29 @@ mod tests {
                 }
             })
             .sum()
+    }
+
+
+    #[tokio::test]
+    async fn bundled_repo_checks_out_local_tags_and_reads_commit_notes() {
+        let root = unique_temp_dir("bundled-tags");
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        commit_and_tag(&source, &source_path, "v1.0.0", "first release");
+        commit_and_tag(&source, &source_path, "v1.1.0", "next release");
+        let next_commit = resolve_tag_commit(&source, "v1.1.0").unwrap().to_string();
+        let repo_path = root.join("repo");
+        bare_clone(&source_path, &repo_path);
+        open_repository(&repo_path).unwrap().remote_delete("origin").unwrap();
+
+        checkout_version_tag("test", &repo_path, "v1.0.0").await.unwrap();
+        assert_eq!(
+            super::get_commit_messages_for_version_diff(&repo_path, &next_commit[..7], "en")
+                .await
+                .unwrap(),
+            vec!["next release"]
+        );
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

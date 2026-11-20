@@ -1,10 +1,10 @@
 // src/ProfileSelectPage.tsx
 import {Button, Container, FormControl, InputLabel, MenuItem, Select, Stack, Typography} from "@mui/material";
 import {useTranslation} from "react-i18next";
-import type {AppInfo} from "./types";
+import type {App} from "./types";
 
 interface ProfileSelectPageProps {
-    app: AppInfo;
+    app: App;
     title: string;
     subtitle?: string;
     selectLabel: string;

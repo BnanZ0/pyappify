@@ -1,4 +1,3 @@
-// src/AppIcon.tsx
 import {useEffect, useState} from "react";
 import {invoke} from "@tauri-apps/api/core";
 import {Box} from "@mui/material";

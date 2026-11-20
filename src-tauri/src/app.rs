@@ -3,7 +3,7 @@ use crate::config_manager::GLOBAL_CONFIG_STATE;
 use crate::utils::defender::is_defender_excluded;
 use crate::utils::path;
 use crate::utils::path::get_app_base_path;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -33,8 +33,19 @@ pub enum AppUpdateState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Installation {
+    pub source: crate::mirror::UpdateSource,
+    pub version: Option<String>,
+    pub current_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct App {
     pub name: String,
+    #[serde(default)]
+    pub mirrorchyan: Option<crate::mirror::MirrorConfig>,
+    #[serde(default)]
+    pub update_source: crate::mirror::UpdateSource,
     #[serde(default)]
     pub icon: String,
     #[serde(default)]
@@ -57,12 +68,29 @@ pub struct App {
     pub current_profile: String,
     #[serde(default)]
     pub installed: bool,
+    /// Committed payload; changing the preferred updater never changes this body.
+    #[serde(default)]
+    pub installation: Option<Installation>,
     #[serde(default = "default_update_method_fn")]
     pub update_method: String,
     #[serde(default)]
     pub auto_start: bool,
     #[serde(default)]
     pub update_state: AppUpdateState,
+    /// Mirror and source conversion transactions do not participate in Git retries.
+    #[serde(default)]
+    pub source_operation_state: AppUpdateState,
+    #[serde(default)]
+    pub source_operation_kind: Option<crate::extensions::cancellation::OperationKind>,
+    #[serde(default)]
+    pub source_operation_target: Option<String>,
+    #[serde(default)]
+    pub source_operation_error: Option<String>,
+    /// In-memory task identity; it is never restored from saved configuration.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<crate::extensions::cancellation::Operation>,
+    #[serde(skip_deserializing, skip_serializing_if = "revision_is_zero")]
+    pub revision: u64,
     #[serde(default)]
     pub update_target_version: Option<String>,
     #[serde(default)]
@@ -81,7 +109,61 @@ fn default_last_start_fn() -> DateTime<Utc> {
     Utc::now()
 }
 
+fn revision_is_zero(revision: &u64) -> bool {
+    *revision == 0
+}
+
 impl App {
+    pub(crate) fn configuration(&self) -> Self {
+        let mut app = self.clone();
+        app.operation = None;
+        app.revision = 0;
+        app
+    }
+
+    pub fn installed_source(&self) -> crate::mirror::UpdateSource {
+        self.installation
+            .as_ref()
+            .map(|record| record.source)
+            .unwrap_or(crate::mirror::UpdateSource::Git)
+    }
+
+    pub fn remember_installation(&mut self) {
+        self.commit_installation(self.installed_source());
+    }
+
+    pub fn commit_installation(&mut self, source: crate::mirror::UpdateSource) {
+        if self.installed {
+            self.installation = Some(Installation {
+                source,
+                version: self.current_version.clone(),
+                current_profile: self.current_profile.clone(),
+            });
+        }
+    }
+
+    pub fn select_update_source(&mut self, source: crate::mirror::UpdateSource) {
+        self.remember_installation();
+        self.update_source = source;
+        self.available_versions.clear();
+    }
+
+    pub(crate) fn consume_startup_notice(
+        &mut self,
+        version: &Option<String>,
+        starting_version: &Option<String>,
+    ) -> bool {
+        if &self.current_version != version
+            || &self.app_starting_version != starting_version
+            || (self.app_starting_version == self.current_version && self.update_note.is_empty())
+        {
+            return false;
+        }
+        self.app_starting_version = self.current_version.clone();
+        self.update_note.clear();
+        true
+    }
+
     pub fn get_repo_path(&self) -> PathBuf {
         path::get_app_repo_path(&self.name)
     }
@@ -213,6 +295,64 @@ pub fn read_embedded_app() -> App {
     }
     app
 }
+
+/// Read the application configuration after startup recovery has finished.
+pub(crate) fn read_app_template() -> Result<(App, Option<crate::frozen::package::Package>)> {
+    let mut template = read_embedded_app();
+    let root = path::get_cwd();
+    let saved = fs::read(get_app_config_json_path(&template.name))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<App>(&bytes).ok());
+    if saved.as_ref().is_some_and(has_committed_git_body) {
+        return Ok((template, None));
+    }
+    let embedded_name = crate::frozen::launcher_identity::embedded_name()?;
+    let Some((package, working)) = crate::frozen::package::read_package(&root, &embedded_name)?
+    else {
+        return Ok((template, None));
+    };
+    template.name = embedded_name;
+    Ok((merge_working_template(template, working)?, Some(package)))
+}
+
+fn has_committed_git_body(app: &App) -> bool {
+    app.installed && app.installed_source() == crate::mirror::UpdateSource::Git
+}
+
+pub(crate) fn merge_working_template(mut template: App, working: App) -> Result<App> {
+    if working.name != template.name {
+        bail!("The working configuration belongs to a different application");
+    }
+    template.icon = working.icon;
+    template.website = working.website;
+    template.mirrorchyan = working.mirrorchyan;
+    template.profiles = working.profiles;
+    if !template
+        .profiles
+        .iter()
+        .any(|profile| profile.name == template.current_profile)
+    {
+        template.current_profile = template.profiles[0].name.clone();
+    }
+    Ok(template)
+}
+
+pub(crate) fn parse_app_template(content: &str) -> Result<App> {
+    let mut app: App = serde_yaml::from_str(content).context("Invalid application YAML")?;
+    if app.profiles.is_empty() {
+        bail!("Application configuration has no profiles");
+    }
+    apply_profile_inheritance(&mut app);
+    app.normalize_preferences();
+    if app.current_profile.is_empty() {
+        app.current_profile = app.profiles.first().unwrap().name.clone();
+        info!(
+            "app current_profile is empty, set to first profile: {}",
+            &app.current_profile
+        );
+    }
+    Ok(app)
+}
 pub fn update_app_from_yml(app: &mut App, file_path_str: &str) {
     let file_path = Path::new(file_path_str);
 
@@ -252,6 +392,9 @@ pub fn update_app_from_yml(app: &mut App, file_path_str: &str) {
 
     app.icon = parsed_app.icon;
     app.website = parsed_app.website;
+    if parsed_app.mirrorchyan.is_some() {
+        app.mirrorchyan = parsed_app.mirrorchyan;
+    }
     app.profiles = parsed_app.profiles;
     app.keep_releases = parsed_app.keep_releases;
 
@@ -268,7 +411,7 @@ pub(crate) fn get_app_config_json_path(app_name: &str) -> PathBuf {
 
 pub(crate) async fn save_app_config_to_json(app: &App) -> anyhow::Result<()> {
     let config_path = get_app_config_json_path(&app.name);
-    let json_data = serde_json::to_string_pretty(app)
+    let json_data = serde_json::to_string_pretty(&app.configuration())
         .with_context(|| format!("Failed to serialize app config for {}", app.name))?;
     if let Some(parent) = config_path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -436,6 +579,138 @@ mod tests {
         write_file_atomically, App, AppUpdateState, Profile, UPDATE_METHOD_OPTION_AUTO,
         UPDATE_METHOD_OPTION_MANUAL,
     };
+
+    fn config_fixture() -> (App, crate::frozen::package::Package, App) {
+        let embedded = super::parse_app_template(
+            "name: example\nmirrorchyan:\n  resource_id: old-resource\nprofiles:\n  - name: old\n    main_script: old.py\n",
+        )
+        .unwrap();
+        let working = super::parse_app_template(
+            "name: example\nmirrorchyan:\n  resource_id: current-resource\nprofiles:\n  - name: current\n    main_script: application.exe\n  - name: debug\n",
+        )
+        .unwrap();
+        let package = crate::frozen::package::Package {
+            app_name: "example".into(),
+            version: "v1.4.9".into(),
+            resource_id: Some("current-resource".into()),
+            executable: "application.exe".into(),
+            profiles: vec!["current".into(), "debug".into()],
+        };
+        (embedded, package, working)
+    }
+
+    #[test]
+    fn working_template_accepts_current_release_configuration_over_older_embedded_defaults() {
+        let (embedded, _, working) = config_fixture();
+        assert_eq!(working.name, embedded.name);
+        let mut foreign = embedded.clone();
+        foreign.name = "other".into();
+        assert!(super::merge_working_template(foreign, working.clone()).is_err());
+        let mut template = embedded;
+        template.auto_start = true;
+        template.update_method = super::UPDATE_METHOD_OPTION_MANUAL.into();
+        let resolved = super::merge_working_template(template, working.clone()).unwrap();
+        assert_eq!(resolved.name, "example");
+        assert!(resolved.auto_start);
+        assert_eq!(resolved.update_method, super::UPDATE_METHOD_OPTION_MANUAL);
+        assert_eq!(resolved.current_profile, "current");
+        assert_eq!(working.current_profile, "current");
+        assert_eq!(working.profiles[1].main_script, "application.exe");
+    }
+
+    #[test]
+    fn working_template_rejects_foreign_release_identity_and_unsafe_paths() {
+        let (template, package, mut foreign) = config_fixture();
+        foreign.name = "other".into();
+        assert!(super::merge_working_template(template, foreign).is_err());
+        for name in ["../example", "example/other", "CON", "example."] {
+            let mut unsafe_package = package.clone();
+            unsafe_package.app_name = name.into();
+            assert!(
+                crate::frozen::package::safe_join(
+                    std::path::Path::new("."),
+                    &format!("data/apps/{}/working", unsafe_package.app_name)
+                )
+                .is_err()
+                    || crate::frozen::package::relative(name)
+                        .unwrap()
+                        .components()
+                        .count()
+                        != 1
+            );
+        }
+    }
+
+    #[test]
+    fn source_preference_preserves_running_git_body_and_failed_retry() {
+        let (mut app, _, _) = config_fixture();
+        app.installed = true;
+        app.running = true;
+        app.current_version = Some("v1.4.8".into());
+        app.update_state = super::AppUpdateState::Failed;
+        app.update_target_version = Some("v1.4.9".into());
+        app.update_error = Some("pip failed".into());
+        app.app_starting_version = Some("v1.4.7".into());
+        app.update_note = vec!["Installed body release".into()];
+        let previous = app.clone();
+        app.select_update_source(crate::mirror::UpdateSource::Mirrorchyan);
+        assert!(app.installed && app.running);
+        assert_eq!(app.current_version, previous.current_version);
+        assert_eq!(app.current_profile, previous.current_profile);
+        assert_eq!(app.profiles, previous.profiles);
+        assert_eq!(app.update_state, previous.update_state);
+        assert_eq!(app.update_target_version, previous.update_target_version);
+        assert_eq!(app.update_error, previous.update_error);
+        assert_eq!(app.app_starting_version, previous.app_starting_version);
+        assert_eq!(app.update_note, previous.update_note);
+        assert_eq!(app.installed_source(), crate::mirror::UpdateSource::Git);
+        assert!(super::has_committed_git_body(&app));
+    }
+
+    #[test]
+    fn source_preference_and_restart_preserve_mirror_until_git_commit() {
+        let (mut app, _, _) = config_fixture();
+        app.installed = true;
+        app.current_version = Some("v1.4.9".into());
+        app.commit_installation(crate::mirror::UpdateSource::Mirrorchyan);
+        app.select_update_source(crate::mirror::UpdateSource::Git);
+        app.revision = 42;
+        app.operation = Some(crate::extensions::cancellation::Operation {
+            id: "not-persistent".into(),
+            sequence: 1,
+            app_name: app.name.clone(),
+            kind: crate::extensions::cancellation::OperationKind::GitInstall,
+            status: crate::extensions::cancellation::OperationStatus::Running,
+            can_cancel: true,
+            target_version: None,
+            previous_version: app.current_version.clone(),
+            profile: None,
+            error: None,
+        });
+        let saved = serde_json::to_value(app.configuration()).unwrap();
+        assert!(saved.get("operation").is_none());
+        assert!(saved.get("revision").is_none());
+        let mut restored: App =
+            serde_json::from_str(&serde_json::to_string(&app).unwrap()).unwrap();
+        assert!(restored.operation.is_none());
+        assert_eq!(restored.revision, 0);
+        assert!(restored.installed);
+        assert_eq!(restored.current_version.as_deref(), Some("v1.4.9"));
+        assert_eq!(
+            restored.installed_source(),
+            crate::mirror::UpdateSource::Mirrorchyan
+        );
+        restored.remember_installation();
+        assert_eq!(
+            restored.installed_source(),
+            crate::mirror::UpdateSource::Mirrorchyan
+        );
+        restored.commit_installation(crate::mirror::UpdateSource::Git);
+        assert_eq!(
+            restored.installed_source(),
+            crate::mirror::UpdateSource::Git
+        );
+    }
 
     #[tokio::test]
     async fn atomically_replaces_existing_app_json() {

@@ -4,7 +4,9 @@ use crate::app::{
     UPDATE_METHOD_OPTION_MANUAL,
 };
 use crate::emitter::get_app_handle;
+use crate::extensions::cancellation;
 use crate::git::ensure_repository;
+use crate::mirror::{service::installed_mirror_package, UpdateSource};
 use crate::runas;
 use crate::utils::error::Error;
 use crate::utils::file::delete_dir_if_exist;
@@ -13,7 +15,7 @@ use crate::utils::path::{get_app_base_path, get_app_working_dir_path, get_python
 use crate::utils::window::{send_notification, update_app_shortcuts};
 use crate::{
     app::{
-        get_app_config_json_path, load_app_config_from_json, read_embedded_app,
+        get_app_config_json_path, load_app_config_from_json, read_app_template, read_embedded_app,
         save_app_config_to_json, update_app_from_yml, Profile, YML_FILE_NAME,
     },
     emit_error, emit_error_finish, emit_info, emit_success_finish, emitter, err, execute_python,
@@ -47,7 +49,6 @@ static APP_DIR_LOCK: Lazy<Arc<Mutex<()>>> = Lazy::new(|| Arc::new(Mutex::new(())
 static APP_LOAD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 pub static AUTO_START_CHECKED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static AUTO_START_CANCELLED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StartupOverrides {
     pub auto_start: Option<bool>,
@@ -78,7 +79,7 @@ async fn find_app_pids(app_name: &str) -> Result<Vec<Pid>> {
     Ok(task::spawn_blocking(move || process::scan_pids_related_to_app_dir(&app_base_path)).await?)
 }
 
-async fn is_app_running(app_name: &str) -> bool {
+pub(crate) async fn is_app_running(app_name: &str) -> bool {
     match find_app_pids(app_name).await {
         Ok(pids) => !pids.is_empty(),
         Err(e) => {
@@ -89,7 +90,7 @@ async fn is_app_running(app_name: &str) -> bool {
 }
 
 /// Refreshes `app` from the YAML file in its working directory, if present.
-fn load_app_details(app: &mut App) {
+pub(crate) fn load_app_details(app: &mut App) {
     let yml_path = get_app_working_dir_path(&app.name).join(YML_FILE_NAME);
     if yml_path.exists() {
         update_app_from_yml(app, &yml_path.to_string_lossy());
@@ -141,7 +142,7 @@ async fn set_app_running(app_name: &str, running: bool) -> bool {
     .unwrap_or(false)
 }
 
-fn resolve_current_version_state(
+pub(crate) fn resolve_current_version_state(
     previous_known_version: Option<String>,
     available_versions: &[String],
     resolved_current: String,
@@ -202,8 +203,15 @@ fn get_update_target<'a>(
         .max_by(|left, right| git::compare_version_tags(left, right).unwrap_or(Ordering::Equal))
 }
 
+static APP_SNAPSHOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub async fn get_app() -> Option<App> {
-    let mut app = APP.lock().await.clone()?;
+    let mut app = {
+        let current = APP.lock().await;
+        let mut app = current.clone()?;
+        app.revision = APP_SNAPSHOT_SEQUENCE.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        app
+    };
     let startup_overrides = STARTUP_OVERRIDES.lock().await.clone();
     if let Some(auto_start) = startup_overrides.auto_start {
         app.auto_start = auto_start;
@@ -211,6 +219,7 @@ pub async fn get_app() -> Option<App> {
     if let Some(update_method) = &startup_overrides.update_method {
         app.update_method = update_method.clone();
     }
+    app.operation = cancellation::current_operation(&app.name);
     Some(app)
 }
 
@@ -219,7 +228,7 @@ pub(crate) async fn get_app_lock(app_name: &str) -> Result<Arc<Mutex<()>>, Error
     Ok(APP_DIR_LOCK.clone())
 }
 
-async fn persist_update_state(
+pub(crate) async fn persist_update_state(
     app_name: &str,
     state: AppUpdateState,
     target_version: Option<String>,
@@ -229,6 +238,9 @@ async fn persist_update_state(
         app.update_state = state;
         app.update_target_version = target_version;
         app.update_error = update_error;
+        if app.update_state == AppUpdateState::Idle {
+            app.remember_installation();
+        }
     })
     .await?
     .with_context(|| format!("App '{}' not found.", app_name))?;
@@ -237,12 +249,21 @@ async fn persist_update_state(
 }
 
 async fn ensure_app_is_ready_to_start(app_name: &str) -> Result<()> {
+    if cancellation::current_kind(app_name).is_some() {
+        bail!("Process in progress...");
+    }
+    if crate::extensions::install_transaction::replacement_pending(&path::get_cwd()) {
+        bail!("Application file recovery must finish before starting");
+    }
     let app_guard = APP.lock().await;
     let app = app_guard
         .as_ref()
         .filter(|app| app.name == app_name)
         .with_context(|| format!("App '{}' not found.", app_name))?;
 
+    if app.source_operation_state == AppUpdateState::Updating {
+        bail!("Application source conversion or Mirror installation is in progress");
+    }
     match app.update_state {
         AppUpdateState::Idle => Ok(()),
         AppUpdateState::Updating => bail!(
@@ -302,9 +323,14 @@ async fn rollback_interrupted_pip_sync_on_startup(app: &mut App, repo_path: &Pat
     Ok(())
 }
 
-async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
+async fn load_and_prepare_app_state(
+    app_template: &App,
+    mirror_body: Option<crate::frozen::package::Package>,
+) -> Result<App> {
     let app_name = &app_template.name;
-    let mut app = match load_app_config_from_json(app_name).await {
+    let stored_app = load_app_config_from_json(app_name).await;
+    let regenerated = should_adopt_unpacked(&stored_app);
+    let mut app = match stored_app {
         Ok(Some(mut app_from_disk)) => {
             info!(
                 "Loaded app '{}' from app.json. {:?}",
@@ -314,12 +340,15 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
             let current_profile = app_from_disk.current_profile.clone();
             app_from_disk.icon = app_template.icon.clone();
             app_from_disk.profiles = app_template.profiles.clone();
+            if app_template.mirrorchyan.is_some() {
+                app_from_disk.mirrorchyan = app_template.mirrorchyan.clone();
+            }
             app_from_disk.current_profile = current_profile;
             app_from_disk
         }
         Ok(None) => {
             info!(
-                "app.json for '{}' not found. Creating from embedded template.",
+                "app.json for '{}' not found. Creating from application template.",
                 app_name
             );
             save_app_config_to_json(app_template).await?;
@@ -329,7 +358,7 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
             let config_path = get_app_config_json_path(app_name);
             let backup_path = backup_invalid_app_config(&config_path).await?;
             warn!(
-                "app.json for '{}' is not valid JSON: {}. Backed it up to '{}' and regenerated it from the embedded template.",
+                "app.json for '{}' is not valid JSON: {}. Backed it up to '{}' and regenerated it from the application template.",
                 app_name,
                 e,
                 backup_path.display()
@@ -340,6 +369,27 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
         Err(e) => return Err(e),
     };
 
+    if regenerated {
+        crate::mirror::service::adopt_unpacked(&mut app, mirror_body.as_ref())?;
+    }
+    if app.installed_source() == UpdateSource::Mirrorchyan {
+        if let Some(record) = &app.installation {
+            app.current_version = record.version.clone();
+            app.current_profile = record.current_profile.clone();
+        }
+        if !app
+            .profiles
+            .iter()
+            .any(|profile| profile.name == app.current_profile)
+        {
+            app.current_profile = app.profiles[0].name.clone();
+        }
+        crate::mirror::service::refresh_installed_body(&mut app, mirror_body)?;
+        crate::mirror::service::restore_interrupted_status(&mut app);
+        save_app_config_to_json(&app).await?;
+        return Ok(app);
+    }
+    crate::mirror::service::restore_interrupted_status(&mut app);
     if app.installed && !check_python_env_exists(app_name) {
         warn!(
             "Python venv for app '{}' is missing. Deleting app artifacts and marking as not installed.",
@@ -388,6 +438,14 @@ async fn load_and_prepare_app_state(app_template: &App) -> Result<App> {
     Ok(app)
 }
 
+fn should_adopt_unpacked(stored: &Result<Option<App>>) -> bool {
+    match stored {
+        Ok(None) => true,
+        Err(error) => is_invalid_json_error(error),
+        _ => false,
+    }
+}
+
 fn is_invalid_json_error(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -430,13 +488,24 @@ pub async fn load_app() -> Result<App, Error> {
         }
     }
 
-    let app_template = read_embedded_app();
+    let root = path::get_cwd();
+    let recovered = task::spawn_blocking(move || crate::mirror::service::recover(&root)).await??;
+    let (app_template, mirror_body) = read_app_template()?;
+    if recovered {
+        emit_info!(&app_template.name, "Recovered the previous installation/update; the original application files and preferences were restored.");
+    }
+    let root = path::get_cwd();
+    task::spawn_blocking(move || {
+        if let Err(error) = crate::extensions::install_transaction::cleanup(&root) {
+            warn!("Could not clean completed ZIP updates: {error}");
+        }
+    });
     info!(
-        "Loading the single, embedded application. profiles {:?}",
+        "Loading the application configuration. profiles {:?}",
         app_template.profiles
     );
 
-    let app = load_and_prepare_app_state(&app_template).await?;
+    let app = load_and_prepare_app_state(&app_template, mirror_body).await?;
     info!(
         "Finished loading app details. {} {}",
         app.name, app.installed
@@ -445,7 +514,18 @@ pub async fn load_app() -> Result<App, Error> {
     *APP.lock().await = Some(app);
     emit_app().await;
 
-    if update_app_from_disk().await? {
+    let mirror_offline_start = get_app().await.is_some_and(|app| {
+        app.update_source == UpdateSource::Mirrorchyan
+            && app.installed
+            && app.update_state == AppUpdateState::Idle
+            && app.auto_start
+    });
+    let changed = if mirror_offline_start {
+        crate::mirror::service::refresh_for_startup().await?
+    } else {
+        update_app_from_disk().await?
+    };
+    if changed {
         emit_app().await;
     } else {
         info!("Not emitting app from disk because no changes were detected from git.");
@@ -471,8 +551,13 @@ async fn run_first_load_checks(
     auto_start_guard: tokio::sync::MutexGuard<'static, bool>,
 ) {
     let startup_overrides = STARTUP_OVERRIDES.lock().await.clone();
-    let mut update_failed =
-        app.update_state != AppUpdateState::Idle && !retry_persisted_update(&mut app).await;
+    let mut update_failed = if app.update_source == UpdateSource::Git
+        && app.installed_source() == UpdateSource::Git
+    {
+        app.update_state != AppUpdateState::Idle && !retry_persisted_update(&mut app).await
+    } else {
+        app.source_operation_state != AppUpdateState::Idle || app.update_state != AppUpdateState::Idle
+    };
 
     let update_method = startup_overrides
         .update_method
@@ -499,16 +584,26 @@ async fn run_first_load_checks(
     info!("locale is {}", get_locale());
 
     if let Some(latest_version) = available_update {
-        if !update_failed && app.installed && !app.available_versions.is_empty() {
+        if !update_failed && app.installed && app.installed_source() == app.update_source {
             update_failed = !handle_available_update(&app, &update_method, latest_version).await;
         }
     }
 
+    if app.update_source == UpdateSource::Mirrorchyan
+        || app.installed_source() == UpdateSource::Mirrorchyan
+    {
+        if let Some(refreshed) = APP.lock().await.clone() {
+            app = refreshed;
+        }
+    }
     if auto_start
         && !update_failed
         && app.update_state == AppUpdateState::Idle
         && app.installed
-        && !app.available_versions.is_empty()
+        && (app.installed_source() == UpdateSource::Mirrorchyan
+            || !app.available_versions.is_empty())
+        && (app.installed_source() != UpdateSource::Mirrorchyan
+            || !AUTO_START_CANCELLED.load(AtomicOrdering::SeqCst))
     {
         info!("Scheduling auto-start for '{}' in 10 seconds.", app.name);
         drop(auto_start_guard);
@@ -550,7 +645,7 @@ async fn retry_persisted_update(app: &mut App) -> bool {
             retry_version
         ),
     );
-    match update_to_version(&app.name, &retry_version).await {
+    match update_to_version(&app.name, &retry_version, None).await {
         Ok(()) => {
             send_notification(
                 app.name.clone(),
@@ -609,7 +704,14 @@ async fn handle_available_update(app: &App, update_method: &str, latest_version:
         app.name.clone(),
         t!("message.new_version_update", version = latest_version.clone()),
     );
-    match update_to_version(&app.name, &latest_version).await {
+    if app.update_source == UpdateSource::Mirrorchyan
+        && crate::mirror::credentials::require_cdk().is_err()
+    {
+        emit_info!(&app.name, "Configure a MirrorChyan CDK in Settings to enable automatic updates.");
+        emitter::emit("mirrorchyan-cdk-required", app.name.clone());
+        return true;
+    }
+    match update_to_version(&app.name, &latest_version, None).await {
         Ok(()) => {
             info!("Auto Update to version {} success.", &latest_version);
             send_notification(
@@ -618,6 +720,7 @@ async fn handle_available_update(app: &App, update_method: &str, latest_version:
             );
             true
         }
+        Err(Error::Cancelled) => false,
         Err(error) => {
             error!(
                 "Auto update for app '{}' to '{}' failed: {}",
@@ -650,7 +753,8 @@ fn schedule_auto_start(app_name: String, auto_start_override: Option<bool>) {
                 current_app.name == app_name
                     && auto_start_override.unwrap_or(current_app.auto_start)
                     && current_app.installed
-                    && !current_app.available_versions.is_empty()
+                    && (current_app.installed_source() == UpdateSource::Mirrorchyan
+                        || !current_app.available_versions.is_empty())
                     && current_app.update_state == AppUpdateState::Idle
             });
 
@@ -667,12 +771,25 @@ fn schedule_auto_start(app_name: String, auto_start_override: Option<bool>) {
 }
 
 async fn update_app_from_disk() -> Result<bool, Error> {
+    if get_app()
+        .await
+        .is_some_and(|app| app.update_source == UpdateSource::Mirrorchyan)
+    {
+        return crate::mirror::service::refresh().await;
+    }
+    if get_app()
+        .await
+        .is_some_and(|app| app.installed_source() == UpdateSource::Mirrorchyan)
+    {
+        return Ok(false);
+    }
     update_app_from_disk_at_version(None).await
 }
 
 async fn update_app_from_disk_at_version(setup_version: Option<&str>) -> Result<bool, Error> {
     let mut app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
     let original_app = app.clone();
+    let querying_operation = cancellation::current_id(&app.name);
 
     info!(
         "Updating full app details (git info and YAML) for '{}'.",
@@ -716,9 +833,33 @@ async fn update_app_from_disk_at_version(setup_version: Option<&str>) -> Result<
     }
 
     info!("App details modified for {}. Saving to disk.", app.name);
-    save_app_config_to_json(&app).await?;
-    *APP.lock().await = Some(app);
+    let mut guard = APP.lock().await;
+    let Some(current) = guard.as_mut() else {
+        return Ok(false);
+    };
+    if cancellation::current_id(&app.name) != querying_operation
+        || !merge_git_version_query(current, &original_app, app)
+    {
+        return Ok(false);
+    }
+    save_app_config_to_json(current).await?;
     Ok(true)
+}
+
+// A version query owns version data, never preferences or installation state.
+fn merge_git_version_query(current: &mut App, queried: &App, result: App) -> bool {
+    if current.update_source != queried.update_source
+        || current.installed_source() != queried.installed_source()
+        || current.installed != queried.installed
+        || current.current_version != queried.current_version
+        || current.current_profile != queried.current_profile
+    {
+        return false;
+    }
+    current.current_version = result.current_version;
+    current.current_version_missing = result.current_version_missing;
+    current.available_versions = result.available_versions;
+    true
 }
 
 #[tauri::command]
@@ -735,6 +876,7 @@ pub async fn delete_app(app_name: &str) -> Result<(), Error> {
     }
     let mut app: App = get_app_by_name(app_name).await?;
     app.installed = false;
+    app.installation = None;
     save_app_config_to_json(&app).await?;
     *APP.lock().await = Some(app);
     emit_app().await;
@@ -746,10 +888,30 @@ pub async fn update_app_preferences(
     app_name: String,
     update_method: Option<String>,
     auto_start: Option<bool>,
+    update_source: Option<UpdateSource>,
 ) -> Result<(), Error> {
     let app_dir_lock = get_app_lock(&app_name).await?;
-    let _guard = app_dir_lock.lock().await;
+    let _guard = if update_source.is_some() {
+        app_dir_lock
+            .try_lock()
+            .map_err(|_| err!("Another application operation is in progress"))?
+    } else {
+        app_dir_lock.lock().await
+    };
     let mut app = get_app_by_name(&app_name).await?;
+    if let Some(source) = update_source {
+        if app.update_state == AppUpdateState::Updating
+            || app.source_operation_state == AppUpdateState::Updating
+        {
+            return Err(err!("Wait for the current update to finish"));
+        }
+        if source == UpdateSource::Mirrorchyan && app.mirrorchyan.is_none() {
+            return Err(err!("MirrorChyan is not configured for this application"));
+        }
+        if source != app.update_source {
+            app.select_update_source(source);
+        }
+    }
 
     if let Some(update_method) = update_method {
         if !matches!(
@@ -789,6 +951,9 @@ pub async fn get_update_notes(app_name: String, version: String) -> Result<Vec<S
     let app_lock = get_app_lock(&app_name).await?;
     let _guard = app_lock.lock().await;
     let app = get_app_by_name(&app_name).await?;
+    if app.update_source == crate::mirror::UpdateSource::Mirrorchyan {
+        return crate::mirror::service::update_notes(&app, &version).await;
+    }
     let messages =
         git::get_commit_messages_for_version_diff(&app.name, &app.get_repo_path(), &version, get_locale())
             .await?;
@@ -806,6 +971,10 @@ pub async fn get_version_list(
     let app = get_app().await.ok_or_else(|| err!("App is not loaded."))?;
     let app_lock = get_app_lock(&app.name).await?;
     let _guard = app_lock.lock().await;
+    if app.update_source == crate::mirror::UpdateSource::Mirrorchyan {
+        // MirrorChyan versions are managed by the launcher, not the Git CLI.
+        return Ok(Vec::new());
+    }
     ensure_repository(&app).await?;
     Ok(git::get_version_history(
         &app.get_repo_path(),
@@ -816,7 +985,7 @@ pub async fn get_version_list(
     .await?)
 }
 
-async fn get_app_by_name(app_name: &str) -> Result<App, Error> {
+pub(crate) async fn get_app_by_name(app_name: &str) -> Result<App, Error> {
     APP.lock()
         .await
         .as_ref()
@@ -826,7 +995,7 @@ async fn get_app_by_name(app_name: &str) -> Result<App, Error> {
 }
 
 /// Supported icon formats. The frontend maps the same extensions to MIME
-/// types in src/AppIcon.tsx; keep the two lists in sync.
+/// types in src/features/app/AppIcon.tsx; keep the two lists in sync.
 fn icon_mime_type(path: &Path) -> Option<&'static str> {
     match path
         .extension()
@@ -976,35 +1145,39 @@ fn get_profile_for_setup<'a>(
     Ok((profile, profile.name.clone()))
 }
 
-#[tauri::command]
-pub async fn setup_app(app_name: &str, profile_name: &str) -> Result<(), Error> {
-    setup_app_at_version(app_name, profile_name, None).await
+pub(crate) async fn setup_git_files(app_name: &str, profile_name: &str) -> Result<String, Error> {
+    setup_git_files_at_version(app_name, profile_name, None).await
 }
 
-pub async fn setup_app_at_version(
+pub(crate) async fn setup_git_files_at_version(
     app_name: &str,
     profile_name: &str,
     version: Option<&str>,
-) -> Result<(), Error> {
-    let app_dir_lock = get_app_lock(app_name).await?;
-    let _guard = app_dir_lock.lock().await;
-
+) -> Result<String, Error> {
     let repo_path = path::get_app_repo_path(app_name);
     let app = get_app_by_name(app_name).await?;
 
+    cancellation::ensure_app_operation_not_cancelled()?;
     ensure_repository(&app).await?;
-
-    // Select the build's tag before copying configuration or installing Python
-    // dependencies. Normal interactive setup retains the latest stable default.
+    // Select the exact release before copying files or installing dependencies.
     if let Some(version) = version {
         git::checkout_version_tag(app_name, &repo_path, version).await?;
     }
+    cancellation::ensure_app_operation_not_cancelled()?;
+    setup_git_files_from_repository(app_name, profile_name).await
+}
 
+pub(crate) async fn setup_git_files_from_repository(
+    app_name: &str,
+    profile_name: &str,
+) -> Result<String, Error> {
+    let repo_path = path::get_app_repo_path(app_name);
     let working_dir_path = get_app_working_dir_path(app_name);
     if !repo_path.exists() {
         return Err(err!("Repo for {} not at {}", app_name, repo_path.display()));
     }
 
+    cancellation::ensure_app_operation_not_cancelled()?;
     delete_dir_if_exist(&working_dir_path).await?;
 
     tokio::fs::create_dir_all(&working_dir_path)
@@ -1012,6 +1185,7 @@ pub async fn setup_app_at_version(
         .with_context(|| format!("Failed to create dir {}", working_dir_path.display()))?;
 
     update_working_from_repo(app_name).await?;
+    cancellation::ensure_app_operation_not_cancelled()?;
 
     let temp_app_for_config = read_working_dir_app_config(app_name);
     let (profile_settings_for_setup, final_profile_name_to_set) =
@@ -1032,6 +1206,30 @@ pub async fn setup_app_at_version(
         );
     }
 
+    cancellation::ensure_app_operation_not_cancelled()?;
+    Ok(final_profile_name_to_set)
+}
+
+pub async fn setup_app_at_version(
+    app_name: &str,
+    profile_name: &str,
+    version: Option<&str>,
+) -> Result<(), Error> {
+    crate::extensions::setup::setup_app_with_version(app_name, profile_name, None, version).await
+}
+
+pub(crate) async fn setup_git_app(
+    app_name: &str,
+    profile_name: &str,
+    version: Option<&str>,
+) -> Result<(), Error> {
+    let final_profile_name_to_set = if version.is_some() {
+        setup_git_files_at_version(app_name, profile_name, version).await?
+    } else {
+        setup_git_files(app_name, profile_name).await?
+    };
+    cancellation::begin_commit()?;
+
     let saved_app = with_loaded_app(app_name, |app| {
         load_app_details(app);
         app.installed = true;
@@ -1040,6 +1238,7 @@ pub async fn setup_app_at_version(
             app.current_version = Some(version.to_string());
             app.current_version_missing = false;
         }
+        app.remember_installation();
         app.clone()
     })
     .await;
@@ -1086,6 +1285,7 @@ async fn rollback_to_previous_version(
     previous_revision: Option<&str>,
     reason: &str,
 ) -> Result<(), Error> {
+    let _recovery = cancellation::shield_recovery(app_name);
     emit_info!(
         app_name,
         "{} Rolling back Git version to {}.",
@@ -1129,8 +1329,6 @@ async fn rollback_to_previous_version(
         previous_version
     );
 
-    update_working_from_repo(app_name).await?;
-
     update_and_save_app(app_name, |app| {
         load_app_details(app);
         app.current_version = Some(previous_version.to_string());
@@ -1148,10 +1346,67 @@ async fn rollback_to_previous_version(
 }
 
 #[tauri::command]
-pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Error> {
+pub async fn update_to_version(
+    app_name: &str,
+    version: &str,
+    operation_id: Option<String>,
+) -> Result<(), Error> {
     info!("Updating {} to version {}", app_name, version);
     let app_dir_lock = get_app_lock(app_name).await?;
     let _lock_guard = app_dir_lock.lock().await;
+    let selected_app = get_app_by_name(app_name).await?;
+    use cancellation::OperationKind::*;
+    let kind = match (
+        selected_app.update_source,
+        selected_app.installed,
+        selected_app.installed_source(),
+    ) {
+        (UpdateSource::Mirrorchyan, true, UpdateSource::Mirrorchyan) => MirrorUpdate,
+        (UpdateSource::Mirrorchyan, _, _) => MirrorInstall,
+        (_, _, UpdateSource::Mirrorchyan) => GitInstall,
+        _ => GitUpdate,
+    };
+    let mut operation = cancellation::AppOperationCancellationGuard::start(
+        app_name,
+        kind,
+        operation_id,
+        Some(version.into()),
+        None,
+        selected_app.current_version.clone(),
+    );
+    let result = update_to_version_body(app_name, version, selected_app)
+        .await
+        .map_err(|error| {
+            if cancellation::is_cancelled(&error) {
+                Error::Cancelled
+            } else {
+                error
+            }
+        });
+    operation.finish(&result);
+    result
+}
+
+async fn update_to_version_body(
+    app_name: &str,
+    version: &str,
+    selected_app: App,
+) -> Result<(), Error> {
+    if selected_app.update_source == UpdateSource::Mirrorchyan {
+        return crate::mirror::service::update(app_name, version, selected_app).await;
+    }
+    if selected_app
+        .installation
+        .as_ref()
+        .is_some_and(|record| record.source == UpdateSource::Mirrorchyan)
+    {
+        return crate::source_switch::setup_git_from_mirror(
+            app_name,
+            &selected_app.current_profile,
+            Some(version),
+        )
+        .await;
+    }
 
     ensure_app_stopped_for_update(app_name).await?;
 
@@ -1184,6 +1439,11 @@ pub async fn update_to_version(app_name: &str, version: &str) -> Result<(), Erro
             }
         },
         Err(error) => {
+            if cancellation::is_cancelled(&error) {
+                persist_update_state(app_name, AppUpdateState::Idle, None, None).await?;
+                emitter::emit_cancelled_finish(app_name);
+                return Err(Error::Cancelled);
+            }
             let message = error.to_string();
             let console_message = format!("Update to version {} failed: {}", version, message);
             record_update_failure(app_name, version, &message, &console_message).await;
@@ -1218,7 +1478,7 @@ async fn record_update_failure(
     emit_error_finish!(app_name);
 }
 
-async fn ensure_app_stopped_for_update(app_name: &str) -> Result<(), Error> {
+pub(crate) async fn ensure_app_stopped_for_update(app_name: &str) -> Result<(), Error> {
     let running_pids = find_app_pids(app_name).await?;
     if !running_pids.is_empty() {
         let pid_list = running_pids
@@ -1274,7 +1534,6 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
                 );
                 let restored_oid =
                     git::checkout_existing_revision(app_name, &repo_path, previous_version).await?;
-                update_working_from_repo(app_name).await?;
                 previous_revision = Some(restored_oid.to_string());
             }
             Ok(_) => {}
@@ -1319,6 +1578,9 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
             version
         );
     }
+    let checkout_result = checkout_result.map_err(Error::from).and_then(|_| {
+        cancellation::ensure_app_operation_not_cancelled()
+    });
     if let Err(sync_error) = checkout_result {
         if let Some(previous_version) = previous_version.as_deref() {
             if let Err(rollback_error) = rollback_to_previous_version(
@@ -1337,6 +1599,9 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
                     rollback_error
                 ));
             }
+        }
+        if cancellation::is_cancelled(&sync_error) {
+            return Err(sync_error);
         }
         return Err(err!("App file synchronization failed: {}", sync_error));
     }
@@ -1424,6 +1689,20 @@ async fn update_to_version_inner(app_name: &str, version: &str) -> Result<(), Er
             app_name,
             "Requirements are up to date. Skipping dependency sync."
         );
+    }
+
+    if let Err(cancelled) = cancellation::begin_commit() {
+        if let Some(previous_version) = previous_version.as_deref() {
+            rollback_to_previous_version(
+                app_name,
+                &repo_path,
+                previous_version,
+                previous_revision.as_deref(),
+                "Operation cancelled by user",
+            )
+            .await?;
+        }
+        return Err(cancelled);
     }
 
     update_and_save_app(app_name, |app| {
@@ -1657,7 +1936,14 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
     let _guard = app_dir_lock.lock().await;
     ensure_app_is_ready_to_start(&app_name).await?;
 
-    if !check_python_env_exists(&app_name) {
+    let app_snapshot = get_app_by_name(&app_name).await?;
+    let mirror_package = installed_mirror_package(&app_snapshot)?;
+    if app_snapshot.installed_source() == UpdateSource::Mirrorchyan {
+        let package = mirror_package.as_ref().context("Mirror application body is missing; user files and the installation record have been kept")?;
+        if !package.payload_present(&path::get_cwd())? {
+            return Err(err!("Mirror application files are missing. Retry installation or update; user data has been kept."));
+        }
+    } else if !check_python_env_exists(&app_name) {
         warn!(
             "Python .venv not found for '{}'. Deleting app artifacts.",
             &app_name
@@ -1674,7 +1960,7 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
     let working_dir = get_app_working_dir_path(&app_name);
     let marker_path = working_dir.join(python_env::PIP_UPDATE_NEEDED_MARKER);
     let app_snapshot = with_loaded_app(&app_name, |app| {
-        if marker_path.exists() {
+        if mirror_package.is_none() && marker_path.exists() {
             info!(
                 "Marker file found for app '{}'. Reloading app details before retry.",
                 app_name
@@ -1692,7 +1978,12 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
             app_name, e
         );
     }
-    let profile_to_run_with = app_snapshot.get_current_profile_settings().clone();
+    let mut profile_to_run_with = app_snapshot.get_current_profile_settings().clone();
+
+    if let Some(package) = &mirror_package {
+        // Keep the source profile's main.py in YAML/app.json for the Git route.
+        profile_to_run_with.main_script = package.executable().into();
+    }
 
     if profile_to_run_with.main_script.is_empty() {
         return Err(anyhow!(
@@ -1711,7 +2002,7 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
         profile_to_run_with.main_script
     );
 
-    if marker_path.exists() {
+    if mirror_package.is_none() && marker_path.exists() {
         info!(
             "Marker file found for app '{}' at {}. Attempting to re-install requirements.",
             app_name,
@@ -1727,7 +2018,7 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
     }
 
     let pyappify_version = app_handle.package_info().version.to_string();
-    let envs = build_python_execution_environment(
+    let mut envs = build_python_execution_environment(
         &app_name,
         &profile_to_run_with,
         app_snapshot.current_version.clone(),
@@ -1735,16 +2026,40 @@ pub async fn start_app(app_handle: AppHandle, app_name: String) -> Result<(), Er
         app_snapshot.update_note.clone(),
         pyappify_version,
     );
-    execute_python::run_python_script(
-        app_name.as_str(),
-        profile_to_run_with.main_script.as_str(),
-        &working_dir,
-        profile_to_run_with.use_pythonw(),
-        envs,
-    )
-    .await?;
+    if mirror_package.is_some() {
+        envs.retain(|(key, _)| key != "PYTHONPATH");
+    }
+    if mirror_package.is_some() {
+        execute_python::run_frozen_app(
+            &app_name,
+            &profile_to_run_with.main_script,
+            &working_dir,
+            envs,
+        )
+        .await?;
+    } else {
+        execute_python::run_python_script(
+            app_name.as_str(),
+            profile_to_run_with.main_script.as_str(),
+            &working_dir,
+            profile_to_run_with.use_pythonw(),
+            envs,
+        )
+        .await?;
+    }
 
     if check_running_on_start(&app_name).await? {
+        // The child keeps its launch environment; only subsequent starts use the consumed notice.
+        let mut app_guard = APP.lock().await;
+        if let Some(app) = app_guard.as_mut().filter(|app| app.name == app_name) {
+            let mut started = app.clone();
+            if started.consume_startup_notice(&app_snapshot.current_version, &app_snapshot.app_starting_version) {
+                save_app_config_to_json(&started).await?;
+                *app = started;
+            }
+        }
+        drop(app_guard);
+        emit_app().await;
         emit_info!(
             app_name,
             "App startup confirmed. Creating or updating Windows shortcuts..."
@@ -1882,6 +2197,20 @@ async fn kill_app_processes(app_name: &str) -> Result<bool> {
 }
 
 #[tauri::command]
+pub async fn cancel_app_operation(app_name: String, operation_id: String) -> Result<bool, Error> {
+    info!(
+        "Cancelling the active install/update operation for: {}",
+        app_name
+    );
+    let accepted = cancellation::request_cancellation(&app_name, &operation_id);
+    if accepted {
+        AUTO_START_CANCELLED.store(true, AtomicOrdering::SeqCst);
+        emit_info!(&app_name, "Cancelling the current operation...");
+    }
+    Ok(accepted)
+}
+
+#[tauri::command]
 pub async fn stop_app(app_name: String) -> Result<(), Error> {
     info!("Attempting to stop app: {}", app_name);
     let app_dir_lock = get_app_lock(&app_name).await?;
@@ -2007,8 +2336,15 @@ pub async fn periodically_update_app_running_status(app_handle: AppHandle) {
         let Some(app_name) = APP.lock().await.as_ref().map(|app| app.name.clone()) else {
             continue;
         };
+        // Installation commands also launch processes in the app directory.
+        if cancellation::current_kind(&app_name).is_some() {
+            continue;
+        }
         let new_status = is_app_running(&app_name).await;
-        if set_app_running(&app_name, new_status).await {
+        if with_loaded_app(&app_name, |app| {
+            cancellation::current_kind(&app_name).is_none()
+                && std::mem::replace(&mut app.running, new_status) != new_status
+        }).await.unwrap_or(false) {
             info!(
                 "Periodic check: running status for '{}' is now {}. Emitting.",
                 app_name, new_status
@@ -2092,6 +2428,42 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn version_queries_preserve_preferences_and_discard_results_after_source_or_body_changes() {
+        let queried: crate::app::App =
+            serde_yaml::from_str("name: fixture\nprofiles: []\n").unwrap();
+        let mut result = queried.clone();
+        result.current_version = Some("v1.4.9".into());
+        result.available_versions = vec!["v1.4.9".into()];
+        let mut current = queried.clone();
+        current.auto_start = !queried.auto_start;
+        current.update_method = "MANUAL_UPDATE".into();
+        assert!(super::merge_git_version_query(
+            &mut current,
+            &queried,
+            result.clone()
+        ));
+        assert_ne!(current.auto_start, queried.auto_start);
+        assert_eq!(current.update_method, "MANUAL_UPDATE");
+        assert_eq!(current.available_versions, result.available_versions);
+        assert_eq!(current.current_version.as_deref(), Some("v1.4.9"));
+        current.select_update_source(crate::mirror::UpdateSource::Mirrorchyan);
+        assert!(!super::merge_git_version_query(
+            &mut current,
+            &queried,
+            result.clone()
+        ));
+        assert!(current.available_versions.is_empty());
+        current.update_source = queried.update_source;
+        current.current_version = Some("v2.0.0".into());
+        assert!(!super::merge_git_version_query(
+            &mut current,
+            &queried,
+            result
+        ));
+        assert_eq!(current.current_version.as_deref(), Some("v2.0.0"));
+    }
+
     use super::{
         backup_invalid_app_config, build_app_shortcut_bootstrap,
         build_python_execution_environment, get_update_target, icon_mime_type,
@@ -2099,6 +2471,18 @@ mod tests {
     };
     use crate::app::{Profile, UPDATE_METHOD_OPTION_AUTO, UPDATE_METHOD_OPTION_AUTO_PRE_RELEASE};
     use std::path::Path;
+
+    #[test]
+    fn regenerated_config_adopts_local_body_only_for_missing_or_invalid_json() {
+        assert!(super::should_adopt_unpacked(&Ok(None)));
+        let error = serde_json::from_str::<crate::app::App>("{").unwrap_err();
+        assert!(super::should_adopt_unpacked(&Err(error.into())));
+        assert!(!super::should_adopt_unpacked(&Err(anyhow::anyhow!(
+            "access denied"
+        ))));
+        let app: crate::app::App = serde_yaml::from_str("name: example\nprofiles: []\n").unwrap();
+        assert!(!super::should_adopt_unpacked(&Ok(Some(app))));
+    }
 
     fn versions(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -2310,6 +2694,91 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("en")
         );
+    }
+
+    #[test]
+    fn python_environment_keeps_the_first_notice_and_consumes_it_for_subsequent_starts() {
+        let profile = Profile {
+            name: "default".to_string(),
+            main_script: "main.py".to_string(),
+            admin: None,
+            use_pythonw: None,
+            show_add_defender: None,
+            requirements: String::new(),
+            python_path: String::new(),
+            git_url: String::new(),
+            requires_python: String::new(),
+            pip_args: String::new(),
+        };
+        let mut app: crate::app::App =
+            serde_yaml::from_str("name: example\nprofiles: []\n").unwrap();
+        app.current_version = Some("v1.4.9".into());
+        app.app_starting_version = Some("v1.4.8".into());
+        app.update_note = vec!["Installed release notes".into()];
+        let version = app.current_version.clone();
+        let starting = app.app_starting_version.clone();
+        let env = build_python_execution_environment(
+            "example",
+            &profile,
+            version.clone(),
+            starting.clone(),
+            app.update_note.clone(),
+            "0.1.0".to_string(),
+        );
+        let app_json_path = env
+            .iter()
+            .find(|(name, _)| name == "PYAPPIFY_APP_JSON_PATH")
+            .map(|(_, value)| Path::new(value))
+            .unwrap();
+
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "PYAPPIFY_PIP_INDEX_API")
+                .map(|(_, value)| value.as_str()),
+            Some("1")
+        );
+        assert!(app_json_path.is_absolute());
+        assert!(app_json_path.ends_with(Path::new("data/apps/example/app.json")));
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "PYAPPIFY_LOCALE")
+                .map(|(_, value)| value.as_str()),
+            Some("en")
+        );
+        let first: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(first["PYAPPIFY_APP_VERSION"], "v1.4.9");
+        assert_eq!(first["PYAPPIFY_APP_STARTING_VERSION"], "v1.4.8");
+        assert_eq!(
+            first["PYAPPIFY_UPDATE_NOTE"],
+            r#"["Installed release notes"]"#
+        );
+        assert_eq!(
+            app.app_starting_version, starting,
+            "dispatch alone must keep the notice"
+        );
+        assert!(app.consume_startup_notice(&version, &starting));
+        let restored: crate::app::App =
+            serde_json::from_value(serde_json::to_value(app.configuration()).unwrap()).unwrap();
+        let next: std::collections::BTreeMap<_, _> = build_python_execution_environment(
+            "example",
+            &profile,
+            restored.current_version.clone(),
+            restored.app_starting_version.clone(),
+            restored.update_note.clone(),
+            "0.1.0".into(),
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(
+            next["PYAPPIFY_APP_STARTING_VERSION"],
+            next["PYAPPIFY_APP_VERSION"]
+        );
+        assert_eq!(next["PYAPPIFY_UPDATE_NOTE"], "");
+        app.current_version = Some("v1.5.0".into());
+        app.app_starting_version = version;
+        app.update_note = vec!["New pending release".into()];
+        assert!(!app.consume_startup_notice(&restored.current_version, &starting));
+        assert_eq!(app.update_note, ["New pending release"]);
     }
 
     #[test]

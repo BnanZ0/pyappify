@@ -94,10 +94,30 @@ pub async fn run_python_script(
     use_pythonw: bool,
     envs: Vec<(String, String)>,
 ) -> Result<(), Error> {
+    run_script(app_name, script, working_dir, use_pythonw, envs, true).await
+}
+
+pub async fn run_frozen_app(
+    app_name: &str,
+    executable: &str,
+    working_dir: &Path,
+    envs: Vec<(String, String)>,
+) -> Result<(), Error> {
+    run_script(app_name, executable, working_dir, false, envs, false).await
+}
+
+async fn run_script(
+    app_name: &str,
+    script: &str,
+    working_dir: &Path,
+    use_pythonw: bool,
+    envs: Vec<(String, String)>,
+    require_python: bool,
+) -> Result<(), Error> {
     let python_dir = get_python_dir(app_name);
     let python_executable = get_python_exe(app_name, use_pythonw);
 
-    if !python_executable.exists() {
+    if require_python && !python_executable.exists() {
         let err_msg = format!(
             "Python executable not found: {}",
             python_executable.display()

@@ -6,10 +6,14 @@ mod config_manager;
 mod emitter;
 mod execute_python;
 pub mod extensions;
+mod frozen;
 mod git;
+mod mirror;
+pub use frozen::packaging;
 mod pip_mirror;
 mod python_env;
 mod runas;
+mod source_switch;
 mod submodule;
 mod utils;
 
@@ -17,9 +21,9 @@ use crate::app::{
     UPDATE_METHOD_OPTION_AUTO, UPDATE_METHOD_OPTION_AUTO_PRE_RELEASE, UPDATE_METHOD_OPTION_MANUAL,
 };
 use crate::app_service::{
-    delete_app, get_app_icon, get_update_notes, get_version_list, load_app, set_startup_overrides,
-    setup_app, setup_app_at_version, start_app, stop_app, update_app_preferences, update_to_version,
-    StartupOverrides, AUTO_START_CHECKED,
+    cancel_app_operation, delete_app, get_app_icon, get_update_notes, get_version_list, load_app,
+    set_startup_overrides, setup_app_at_version, start_app, stop_app,
+    update_app_preferences, update_to_version, StartupOverrides, AUTO_START_CHECKED,
 };
 use crate::config_manager::{
     get_config_payload, init_config_manager, save_configuration, update_config_item,
@@ -330,10 +334,13 @@ async fn execute_update_request(options: &CommandLineOptions) -> Result<String, 
     let app = load_app()
         .await
         .map_err(|error| format!("Failed to load app: {error}"))?;
+    if app.update_source == mirror::UpdateSource::Mirrorchyan {
+        return Err("Use the launcher window for MirrorChyan updates; this CLI command only performs Git updates.".into());
+    }
     stop_app(app.name.clone())
         .await
         .map_err(|error| format!("Failed to stop {} before updating: {error}", app.name))?;
-    update_to_version(&app.name, version)
+    update_to_version(&app.name, version, None)
         .await
         .map_err(|error| format!("Failed to update to version {version}: {error}"))?;
     serde_json::to_string(&serde_json::json!({
@@ -524,6 +531,13 @@ async fn show_main_window(window: tauri::Window) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub async fn run() {
     let command_line_args = env::args().collect::<Vec<_>>();
+    if let Some(result) = frozen::packaging::try_run(&command_line_args) {
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let command_line_options = match parse_command_line(&command_line_args) {
         Ok(options) => options,
         Err(error) => {
@@ -759,9 +773,10 @@ pub async fn run() {
                 show_main_window,
                 start_app,
                 stop_app,
+                cancel_app_operation,
                 load_app,
                 get_app_icon,
-                setup_app,
+                extensions::setup::setup_app,
                 delete_app,
                 get_update_notes,
                 update_to_version,
@@ -769,6 +784,8 @@ pub async fn run() {
                 update_config_item,
                 save_configuration,
                 get_config_payload,
+                mirror::credentials::mirrorchyan_has_cdk,
+                mirror::credentials::mirrorchyan_set_cdk,
                 add_defender_exclusion,
                 send_notification_cmd,
             ])

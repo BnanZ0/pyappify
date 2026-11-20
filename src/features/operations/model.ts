@@ -1,5 +1,5 @@
 import type {App, MessagePayload, Operation, Task} from '../../types';
-import {getVersionActionType} from '../app/versions';
+import {getVersionActionType} from '../../versions';
 
 export const isTaskActive = (task?: Operation | null) => !!task && ['pending', 'running', 'cancelling'].includes(task.status);
 export const isConfiguration = (task: Operation) => task.kind.endsWith('_configure');
@@ -15,7 +15,7 @@ export function taskForApp(task: Task | undefined, app: App | null, logs: Messag
     return {id: `failure:${app.name}`, sequence: 0, app_name: app.name,
         kind: sourceFailed ? app.source_operation_kind ?? 'mirror_install' : 'git_update', status: 'failed', can_cancel: false,
         target_version: target ?? null, profile: app.current_profile, error,
-        action: getVersionActionType(target ?? '', app.current_version, 'Upgrade'),
+        action: getVersionActionType(target ?? '', app.current_version, 'Upgrade', app.available_versions),
         logs: error && !logs.some(log => log.message.includes(error)) ? appendLog(logs, {app_name: app.name, message: error, error: true}) : logs};
 }
 
@@ -27,7 +27,7 @@ export function acceptOperation(previous: Task | undefined, operation: Operation
         if (previous.status === 'cancelling' && operation.status === 'running' && operation.sequence <= previous.sequence) return previous;
         return {...previous, ...operation};
     }
-    return {...operation, logs: [], action: getVersionActionType(operation.target_version ?? '', operation.previous_version ?? app?.current_version ?? null, 'Upgrade')};
+    return {...operation, logs: [], action: getVersionActionType(operation.target_version ?? '', operation.previous_version ?? app?.current_version ?? null, 'Upgrade', app?.available_versions)};
 }
 
 export function appendLog(logs: MessagePayload[], log: MessagePayload): MessagePayload[] {

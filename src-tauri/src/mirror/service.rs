@@ -9,7 +9,6 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use sysinfo::{ProcessesToUpdate, System};
 use tokio::task;
 use tracing::info;
 
@@ -164,13 +163,7 @@ pub(crate) async fn finish_failed_operation(
         Err(rollback) => format!("{error:#}; recovery failed: {rollback:#}"),
     };
     restore_operation_state(&mut previous, target, cancelled, error_message.clone());
-    let name = app_name.to_string();
-    previous.running = task::spawn_blocking(move || {
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-        is_app_running(&system, &name)
-    })
-    .await?;
+    previous.running = is_app_running(app_name).await;
     save_app_config_to_json(&previous).await?;
     *APP.lock().await = Some(previous.configuration());
     emit_app().await;

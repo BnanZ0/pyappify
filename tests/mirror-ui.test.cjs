@@ -435,3 +435,27 @@ test('restored tasks show only their logs; runtime Console does not load install
         assert.ok(!f.container.textContent.includes('CURRENT INSTALL'));
     } finally {await f.dispose();}
 });
+
+test('Git commit versions use repository order in the proposal and confirmation', async () => {
+    const f = await fixture({installed: true, current_version: 'fedcba9',
+        available_versions: ['1a2b3c4', 'fedcba9', 'abcdef0']});
+    try {
+        assert.ok(f.container.textContent.includes('Upgrade: 1a2b3c4'));
+        await f.click('Confirm Upgrade');
+        assert.equal(f.operation().target_version, '1a2b3c4');
+        assert.equal(f.operation().kind, 'git_update');
+    } finally {await f.dispose();}
+});
+
+test('flushing buffered console history keeps task and application logs', async () => {
+    const operation = {id: 'running-install', sequence: 1, app_name: 'ok-nte', kind: 'git_install', status: 'running'};
+    const runtime = {app_name: 'ok-nte', message: 'Previous application output'};
+    const task = {app_name: 'ok-nte', operation_id: operation.id, message: 'Installing dependencies'};
+    const f = await fixture({operation}, [runtime]);
+    try {
+        await f.emit('app-log', task);
+        window.dispatchEvent(new window.Event('beforeunload'));
+        const stored = JSON.parse(localStorage.getItem('pyappifyConsoleLogs'));
+        assert.deepEqual(stored['ok-nte'], [runtime, task]);
+    } finally {await f.dispose();}
+});

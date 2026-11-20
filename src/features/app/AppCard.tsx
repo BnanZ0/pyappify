@@ -4,7 +4,8 @@ import {Build, Cached, Delete, KeyboardArrowRight, OpenInNew, PlayArrow, Setting
 import {alpha} from '@mui/material/styles';
 import {openUrl} from '@tauri-apps/plugin-opener';
 import AppIcon from './AppIcon';
-import {compareVersions, getVersionActionProgressKey, getVersionActionType, getVersionChannelLabelKey} from './versions';
+import {UPDATE_METHOD_OPTIONS} from '../../types';
+import {compareVersions, getVersionActionProgressKey, getVersionActionType, getVersionChannelLabelKey} from '../../versions';
 import {sourceNeedsInstallation} from '../mirror/operationUi';
 import {isTaskActive, taskForApp} from '../operations/model';
 import TaskConsole from '../operations/TaskConsole';
@@ -27,9 +28,8 @@ export default function AppCard({state, controller, inlineConsole, onConsole, on
     const isThisAppLoading = !!state.request || taskActive;
     const disableRowActions = isThisAppLoading || (selectedInstalled && app.update_state !== 'idle') || app.source_operation_state === 'updating';
     const disableUpdateControls = isThisAppLoading || app.update_state === 'updating' || app.source_operation_state === 'updating';
-    const persistedActionType = task?.action ?? getVersionActionType(app.update_target_version ?? '', app.current_version, 'Upgrade');
+    const persistedActionType = task?.action ?? getVersionActionType(app.update_target_version ?? '', app.current_version, 'Upgrade', app.available_versions);
     const inlineUpdateEntry = state.proposal;
-    const UPDATE_METHOD_OPTIONS = ['MANUAL_UPDATE', 'AUTO_UPDATE', 'AUTO_UPDATE_PRE_RELEASE'] as const;
     const openWebsite = () => {if (app.website?.trim()) void openUrl(app.website.trim()).catch(console.warn);};
     return (
         <Card
@@ -187,7 +187,7 @@ export default function AppCard({state, controller, inlineConsole, onConsole, on
                                             onChange={(e) => controller.selectVersion(e.target.value)}
                                         >
                                             <MenuItem value=""><em>{t('Change version...')}</em></MenuItem>
-                                            {app.available_versions.filter(v => v !== app.current_version).map(v => <MenuItem key={v} value={v}>{v} {t(getVersionChannelLabelKey(v))}{compareVersions(v, app.current_version!) > 0 ? ` ${t('(Upgrade)')}` : ` ${t('(Downgrade)')}`}</MenuItem>)}
+                                            {app.available_versions.filter(v => v !== app.current_version).map(v => <MenuItem key={v} value={v}>{v} {t(getVersionChannelLabelKey(v))}{compareVersions(v, app.current_version!, app.available_versions) > 0 ? ` ${t('(Upgrade)')}` : ` ${t('(Downgrade)')}`}</MenuItem>)}
                                         </Select>
                                     </FormControl>
                                 ) : <Typography variant="caption">{t("No other versions found.")}</Typography>}

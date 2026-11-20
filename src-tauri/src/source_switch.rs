@@ -133,6 +133,13 @@ pub(crate) async fn setup_git_from_mirror(
         })
         .await??;
         crate::extensions::cancellation::ensure_app_operation_not_cancelled()?;
+        let rollback = serde_json::to_string_pretty(&previous.configuration())?;
+        let (prepared, working_backup) = task::spawn_blocking(move || -> Result<_> {
+            let backup = prepare_body(&mut transaction, &rollback)?;
+            Ok((transaction, backup))
+        })
+        .await??;
+        transaction = prepared;
         let mut clone_app = previous.clone();
         clone_app.current_profile = profile_name.into();
         git::ensure_repository(&clone_app).await?;
@@ -142,19 +149,12 @@ pub(crate) async fn setup_git_from_mirror(
                 .await?;
         }
         crate::extensions::cancellation::ensure_app_operation_not_cancelled()?;
-        let rollback = serde_json::to_string_pretty(&previous.configuration())?;
-        let (prepared, working_backup) = task::spawn_blocking(move || -> Result<_> {
-            let backup = prepare_body(&mut transaction, &rollback)?;
-            Ok((transaction, backup))
-        })
-        .await??;
-        transaction = prepared;
         let final_profile = setup_git_files_from_repository(app_name, profile_name).await?;
         crate::extensions::cancellation::ensure_app_operation_not_cancelled()?;
         let repo = path::get_app_repo_path(app_name);
         let (versions, current) = git::get_tags_and_current_version(app_name, repo.clone()).await?;
         let mut updated = previous.clone();
-        load_app_details(&mut updated).await?;
+        load_app_details(&mut updated);
         updated.current_profile = final_profile;
         if let Some(version) = version {
             if !versions.iter().any(|available| available == version) {
@@ -253,8 +253,8 @@ pub(crate) fn installed_program(
 mod tests {
     use super::*;
 
-    #[test]
-    fn repository_preparation_keeps_the_body_until_setup_and_recovery_restores_it() {
+    #[tokio::test]
+    async fn recovery_restores_mirror_body_after_git_checkout_writes_to_working() {
         let root = std::env::temp_dir().join(format!(
             "pyappify-source-transaction-{:x}",
             rand::random::<u64>()
@@ -274,11 +274,18 @@ mod tests {
             fs::read(base.join("python/python.exe")).unwrap(),
             b"original"
         );
-        fs::create_dir_all(base.join("repo")).unwrap();
-        fs::write(base.join("repo/new-repo"), b"new").unwrap();
         prepare_body(&mut transaction, "{}").unwrap();
-        fs::create_dir_all(base.join("working")).unwrap();
-        fs::write(base.join("working/new-body"), b"new").unwrap();
+        let repo_path = base.join("repo");
+        {
+            let repo = git2::Repository::init_bare(&repo_path).unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert("new-body", repo.blob(b"new").unwrap(), 0o100644).unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "Git body", &tree, &[]).unwrap();
+        }
+        git::checkout_head_to_working("example", &repo_path).await.unwrap();
+        assert_eq!(fs::read(base.join("working/new-body")).unwrap(), b"new");
         crate::extensions::install_transaction::recover(&root).unwrap();
         assert_eq!(fs::read(base.join("working/user")).unwrap(), b"original");
         assert_eq!(
@@ -287,7 +294,7 @@ mod tests {
         );
         assert_eq!(fs::read(base.join("repo/old-repo")).unwrap(), b"original");
         assert!(!base.join("working/new-body").exists());
-        assert!(!base.join("repo/new-repo").exists());
+        assert!(!base.join("repo/objects").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

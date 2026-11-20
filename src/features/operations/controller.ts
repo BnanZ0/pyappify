@@ -2,7 +2,7 @@ import {mirrorPhaseLabel} from '../mirror/progress';
 import type {App, MessagePayload, MirrorProgress, Operation, StatusState, Task, VersionProposal} from '../../types';
 import type {TFunction} from 'i18next';
 import {acceptOperation, acceptTaskLog, appendLog, isTaskActive, isUpdate, taskForApp} from './model';
-import {compareVersions, getVersionActionType, isReleaseVersion} from '../app/versions';
+import {compareVersions, getVersionActionType, isReleaseVersion} from '../../versions';
 import {installationKind, installedSource, sourceNeedsInstallation} from '../mirror/operationUi';
 
 export interface Transport {
@@ -22,6 +22,16 @@ export interface LauncherState {
 }
 const errorText = (error: unknown) => typeof error === 'object' && error !== null && 'message' in error ? String(error.message) : String(error);
 const cancelledError = (error: unknown) => typeof error === 'object' && error !== null && 'kind' in error && error.kind === 'cancelled';
+const CONSOLE_LOG_STORAGE_KEY = 'pyappifyConsoleLogs';
+
+function loadConsoleHistory(): Record<string, MessagePayload[]> {
+    try {
+        const history = JSON.parse(localStorage.getItem(CONSOLE_LOG_STORAGE_KEY) ?? '{}');
+        return history && typeof history === 'object' ? history : {};
+    } catch {
+        return {};
+    }
+}
 
 export function createLauncherController(transport: Transport, translate: TFunction) {
     let t = translate;
@@ -33,20 +43,27 @@ export function createLauncherController(transport: Transport, translate: TFunct
     let disposed = false;
     let connectionGeneration = 0;
     let requestGeneration = 0;
+    const consoleHistory = loadConsoleHistory();
+    let pendingLogWrite: ReturnType<typeof setTimeout> | undefined;
     const publish = (next: LauncherState) => { state = next; subscribers.forEach(listener => listener()); };
     const patch = (change: Partial<LauncherState>) => publish({...state, ...change});
     const updateStatus = (change: Partial<StatusState>) => patch({status: {...state.status, ...change}});
     const clearMessages = () => updateStatus({error: null, info: null});
     const storedLogs = (name: string): MessagePayload[] => {
-        try {return JSON.parse(localStorage.getItem('pyappifyConsoleLogs') ?? '{}')[name] ?? [];}
-        catch {return [];}
+        const logs = consoleHistory[name];
+        return Array.isArray(logs) ? logs : [];
+    };
+    const flushLogs = () => {
+        if (pendingLogWrite === undefined) return;
+        clearTimeout(pendingLogWrite);
+        pendingLogWrite = undefined;
+        try {localStorage.setItem(CONSOLE_LOG_STORAGE_KEY, JSON.stringify(consoleHistory));}
+        catch { /* Console history does not control task state. */ }
     };
     const persistLogs = (name: string, logs: MessagePayload[]) => {
-        try {
-            const stored = JSON.parse(localStorage.getItem('pyappifyConsoleLogs') ?? '{}');
-            const otherStream = storedLogs(name).filter(log => !!log.operation_id !== !!logs[0]?.operation_id);
-            localStorage.setItem('pyappifyConsoleLogs', JSON.stringify({...stored, [name]: [...otherStream, ...logs]}));
-        } catch { /* Console history does not control task state. */ }
+        const otherStream = storedLogs(name).filter(log => !!log.operation_id !== !!logs[0]?.operation_id);
+        consoleHistory[name] = [...otherStream, ...logs];
+        pendingLogWrite ??= setTimeout(flushLogs, 1000);
     };
     const notify = (task: Task) => {
         if (!isUpdate(task) || !task.target_version || notifiedTask === task.id || manualTask !== task.id) return;
@@ -79,14 +96,14 @@ export function createLauncherController(transport: Transport, translate: TFunct
         if (proposal && app.update_source === 'mirrorchyan' && !isTaskActive(state.task)
             && proposal.version !== app.current_version && !app.available_versions.includes(proposal.version)) {
             const latest = app.available_versions[0];
-            if (latest) proposal = {version: latest, actionType: getVersionActionType(latest, app.current_version)};
+            if (latest) proposal = {version: latest, actionType: getVersionActionType(latest, app.current_version, 'Set', app.available_versions)};
         }
         if (!proposal && !proposalDismissed && app.installed && !sourceNeedsInstallation(app) && !app.running && !isTaskActive(state.task)) {
             if (app.update_state === 'failed' && app.update_target_version) {
-                proposal = {version: app.update_target_version, actionType: getVersionActionType(app.update_target_version, app.current_version, 'Upgrade')};
+                proposal = {version: app.update_target_version, actionType: getVersionActionType(app.update_target_version, app.current_version, 'Upgrade', app.available_versions)};
             } else {
-                const latest = app.available_versions.filter(isReleaseVersion).sort((a, b) => compareVersions(b, a))[0];
-                if (latest && app.current_version && compareVersions(latest, app.current_version) > 0) proposal = {version: latest, actionType: 'Upgrade'};
+                const latest = app.available_versions.filter(isReleaseVersion).sort((a, b) => compareVersions(b, a, app.available_versions))[0];
+                if (latest && app.current_version && compareVersions(latest, app.current_version, app.available_versions) > 0) proposal = {version: latest, actionType: 'Upgrade'};
             }
         }
         let applicationLogs = state.applicationLogs;
@@ -133,7 +150,7 @@ export function createLauncherController(transport: Transport, translate: TFunct
             id, sequence: (state.task?.sequence ?? 0) + 1, app_name: app.name,
             kind, status: 'pending', can_cancel: false, target_version: typeof args.version === 'string' ? args.version : null,
             previous_version: app.current_version, profile: typeof args.profileName === 'string' ? args.profileName : null,
-            error: null, notes, logs: [{app_name: app.name, operation_id: id, message}], action: getVersionActionType(String(args.version ?? ''), app.current_version, 'Upgrade'),
+            error: null, notes, logs: [{app_name: app.name, operation_id: id, message}], action: getVersionActionType(String(args.version ?? ''), app.current_version, 'Upgrade', app.available_versions),
         };
         manualTask = task.id;
         patch({task, proposal: isUpdate(task) && task.target_version ? {version: task.target_version, actionType: task.action} : null});
@@ -176,6 +193,7 @@ export function createLauncherController(transport: Transport, translate: TFunct
         async connect(onChooseProfile: (app: App) => void) {
             disposed = false;
             const generation = ++connectionGeneration;
+            window.addEventListener('beforeunload', flushLogs);
             const guard = <T,>(handler: (event: {payload: T}) => void) => (event: {payload: T}) => {if (generation === connectionGeneration && !disposed) handler(event);};
             const registrations = await Promise.allSettled([
                 transport.listen<App>('app', guard(event => receiveApp(event.payload))),
@@ -198,10 +216,15 @@ export function createLauncherController(transport: Transport, translate: TFunct
             void transport.invoke<App>('load_app').then(app => {if (!disposed && generation === connectionGeneration && !state.app) receiveApp(app);}).catch(error => {if (generation === connectionGeneration) updateStatus({loading: false, error: `Failed to load app: ${errorText(error)}`});});
             return () => {unlisteners.forEach(unlisten => unlisten());};
         },
-        disconnect() { disposed = true; connectionGeneration++; },
+        disconnect() {
+            disposed = true;
+            connectionGeneration++;
+            window.removeEventListener('beforeunload', flushLogs);
+            flushLogs();
+        },
         selectVersion(version: string) {
             proposalDismissed = !version;
-            patch({proposal: version ? {version, actionType: getVersionActionType(version, state.app?.current_version ?? null)} : null});
+            patch({proposal: version ? {version, actionType: getVersionActionType(version, state.app?.current_version ?? null, 'Set', state.app?.available_versions)} : null});
         },
         install(profileName: string) {
             const app = state.app;
@@ -219,7 +242,7 @@ export function createLauncherController(transport: Transport, translate: TFunct
             const kind = app.update_source === 'git'
                 ? installedSource(app) === 'mirrorchyan' ? 'git_install' : 'git_update'
                 : app.installed && installedSource(app) === 'mirrorchyan' ? 'mirror_update' : 'mirror_install';
-            const action = getVersionActionType(version, app.current_version);
+            const action = getVersionActionType(version, app.current_version, 'Set', app.available_versions);
             if (kind.endsWith('_update')) void transport.invoke('send_notification_cmd', {title: `${t(action)}: ${app.name}`, body: notes ? `${version}\n${notes}` : version}).catch(console.warn);
             return runTask(kind, 'update_to_version', {appName: app.name, version}, kind.endsWith('_update') ? `Initiating ${action} for '${app.name}' to version '${version}'...` : t('Installing App: {{appName}}', {appName: app.name}), notes);
         },

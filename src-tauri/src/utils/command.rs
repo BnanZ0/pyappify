@@ -3,6 +3,7 @@ use crate::utils::error::Error;
 use crate::{emit_error, emit_info, ensure_some, err};
 use std::ffi::OsStr;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tracing::{debug, error, info};
@@ -13,23 +14,26 @@ pub async fn run_command_and_stream_output(
     app_name: &str,
     command_description: &str,
 ) -> Result<ExitStatus, Error> {
-    run_command_inner(command, app_name, command_description, None).await
+    run_command(command, app_name, command_description, None, None).await
 }
 
-pub(crate) async fn run_command_cancellable(
+/// Like `run_command_and_stream_output`, also appending stdout and stderr to `output`.
+pub async fn run_command_and_capture_output(
     command: Command,
     app_name: &str,
-    description: &str,
-    token: std::sync::Arc<crate::extensions::cancellation::Cancellation>,
+    command_description: &str,
+    output: Arc<Mutex<String>>,
 ) -> Result<ExitStatus, Error> {
-    run_command_inner(command, app_name, description, Some(token)).await
+    let token = crate::extensions::cancellation::current_token(app_name);
+    run_command(command, app_name, command_description, Some(output), token).await
 }
 
-async fn run_command_inner(
+async fn run_command(
     mut command: Command,
     app_name: &str,
     command_description: &str,
-    token: Option<std::sync::Arc<crate::extensions::cancellation::Cancellation>>,
+    output: Option<Arc<Mutex<String>>>,
+    token: Option<Arc<crate::extensions::cancellation::Cancellation>>,
 ) -> Result<ExitStatus, Error> {
     emit_info!(
         app_name,
@@ -103,12 +107,16 @@ async fn run_command_inner(
     let mut stderr_buf_reader = tokio::io::BufReader::new(stderr);
 
     let app_name_for_stdout = app_name.to_string();
+    let output_for_stdout = output.clone();
     let stdout_task = tokio::spawn(async move {
         let mut buffer = String::new();
         loop {
             match stdout_buf_reader.read_line(&mut buffer).await {
                 Ok(0) => break,
                 Ok(_) => {
+                    if let Some(output) = &output_for_stdout {
+                        output.lock().unwrap().push_str(&buffer);
+                    }
                     crate::emitter::emit_log_for_operation(
                         app_name_for_stdout.clone(),
                         buffer.as_str(),
@@ -135,6 +143,9 @@ async fn run_command_inner(
                 Ok(_) => {
                     let err_string = buffer.to_string();
                     buffer.clear();
+                    if let Some(output) = &output {
+                        output.lock().unwrap().push_str(&err_string);
+                    }
                     if !err_string.trim().is_empty()
                         && !err_string.contains("A new release of pip is available")
                         && !err_string.contains("[notice] To update, run")

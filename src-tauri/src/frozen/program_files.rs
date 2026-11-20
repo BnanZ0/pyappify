@@ -113,7 +113,7 @@ impl ProgramFiles {
     }
 
     pub fn git(repo: &Path, revision: Option<&str>) -> Result<Self> {
-        let repository = git2::Repository::open(repo)?;
+        let repository = crate::git::open_repository(repo)?;
         let tree = match revision {
             Some(revision) => repository.revparse_single(revision)?.peel_to_tree()?,
             None => repository.head()?.peel_to_tree()?,
@@ -236,15 +236,8 @@ pub fn migrate_users(
         .into_iter()
         .filter_entry(|entry| {
             let value = entry.path().strip_prefix(old).unwrap_or(Path::new(""));
-            !value.components().next().is_some_and(|part| {
-                matches!(
-                    part.as_os_str()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "_internal" | ".git"
-                )
-            })
+            !value.components().next().is_some_and(|part| part.as_os_str().eq_ignore_ascii_case("_internal"))
+                && !value.components().any(|part| part.as_os_str().eq_ignore_ascii_case(".git"))
         })
     {
         if cancelled() {

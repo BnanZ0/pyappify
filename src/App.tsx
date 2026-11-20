@@ -3,8 +3,8 @@ import {useCallback, useEffect, useMemo, useState} from 'react';
 import {getVersion} from '@tauri-apps/api/app';
 import {getCurrentWindow} from '@tauri-apps/api/window';
 import {useTranslation} from 'react-i18next';
-import {Alert, Box, Button, Card, CardContent, CircularProgress, Container, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, FormControl, InputLabel, Link, MenuItem, Select, Snackbar, Stack, Typography} from '@mui/material';
-import {createTheme, ThemeProvider} from '@mui/material/styles';
+import {Alert, Box, Button, Card, CardContent, CircularProgress, Container, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Link, Snackbar, Typography} from '@mui/material';
+import {ThemeProvider} from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
 import useMediaQuery from '@mui/material/useMediaQuery';
 import AppCard from './features/app/AppCard';
@@ -13,7 +13,9 @@ import {isTaskActive, taskForApp} from './features/operations/model';
 import {useLauncherController} from './features/operations/useLauncherController';
 import ConsolePage from './ConsolePage';
 import SettingsPage from './SettingsPage';
-import type {App as LauncherApp, ThemeModeSetting} from './types';
+import ProfileSelectPage from './ProfileSelectPage';
+import {createAppTheme, loadThemeMode, saveThemeMode} from './theme';
+import {pickInitialProfile, type App as LauncherApp} from './types';
 
 function App() {
     const {t} = useTranslation();
@@ -31,13 +33,10 @@ function App() {
     const [snackbarOpen, setSnackbarOpen] = useState(false);
     const [snackbarMessage, setSnackbarMessage] = useState('');
     const [snackbarSeverity, setSnackbarSeverity] = useState<'info' | 'error'>('info');
-    const [themeMode, setThemeMode] = useState<ThemeModeSetting>(() => {
-        const saved = localStorage.getItem('appThemeMode');
-        return saved === 'light' || saved === 'dark' ? saved : 'system';
-    });
+    const [themeMode, setThemeMode] = useState(loadThemeMode);
     const chooseProfile = useCallback((app: LauncherApp) => {
         setProfileChoiceApp(app);
-        setSelectedProfileForInstall(app.profiles.some(profile => profile.name === app.current_profile) ? app.current_profile : app.profiles[0]?.name || 'default');
+        setSelectedProfileForInstall(pickInitialProfile(app, 'default'));
         setCurrentPage('profileChooser');
     }, []);
     const state = useLauncherController(t, chooseProfile);
@@ -46,54 +45,10 @@ function App() {
     const busy = isTaskActive(task) || !!state.request;
     const {updateStatus, clearMessages} = controller;
     const prefersDarkMode = useMediaQuery('(prefers-color-scheme: dark)');
-    const muiTheme = useMemo(() => {
-        const mode: 'light' | 'dark' = themeMode === 'system' ? (prefersDarkMode ? 'dark' : 'light') : themeMode;
-        const isDark = mode === 'dark';
-        return createTheme({
-            palette: {
-                mode,
-                primary: {main: '#6366f1'},
-                success: {main: isDark ? '#34d399' : '#059669'},
-                warning: {main: isDark ? '#fbbf24' : '#d97706'},
-                background: {
-                    default: isDark ? '#0b0f17' : '#f4f6fb',
-                    paper: isDark ? '#121824' : '#ffffff',
-                },
-                divider: isDark ? 'rgba(148, 163, 184, 0.16)' : 'rgba(15, 23, 42, 0.10)',
-            },
-            shape: {borderRadius: 12},
-            typography: {
-                fontFamily: 'Inter, "Segoe UI", system-ui, sans-serif',
-                h5: {fontWeight: 720, letterSpacing: '-0.025em'},
-                h6: {fontWeight: 700, letterSpacing: '-0.015em'},
-                button: {fontWeight: 650, letterSpacing: 0, textTransform: 'none'},
-            },
-            components: {
-                MuiButton: {
-                    defaultProps: {disableElevation: true},
-                    styleOverrides: {root: {borderRadius: 10, minHeight: 38}},
-                },
-                MuiCard: {
-                    styleOverrides: {
-                        root: {
-                            borderRadius: 18,
-                            boxShadow: isDark
-                                ? '0 18px 50px rgba(0, 0, 0, 0.28)'
-                                : '0 18px 50px rgba(30, 41, 59, 0.07)',
-                        },
-                    },
-                },
-                MuiFormControl: {
-                    styleOverrides: {root: {'& .MuiOutlinedInput-root': {borderRadius: 10}}},
-                },
-                MuiTooltip: {defaultProps: {arrow: true}},
-            },
-        });
-    }, [themeMode, prefersDarkMode]);
-
+    const muiTheme = useMemo(() => createAppTheme(themeMode, prefersDarkMode), [themeMode, prefersDarkMode]);
 
     useEffect(() => {void getVersion().then(setAppVersion);}, []);
-    useEffect(() => {localStorage.setItem('appThemeMode', themeMode);}, [themeMode]);
+    useEffect(() => {saveThemeMode(themeMode);}, [themeMode]);
     useEffect(() => {
         if (!app?.name) return;
         const title = t('appLauncherName', {appName: app.name});
@@ -162,56 +117,21 @@ function App() {
         pageContent = <SettingsPage app={app} busy={busy} saving={state.request === 'settings'} runRequest={controller.setting} currentTheme={themeMode} onChangeTheme={setThemeMode}
             onBack={() => setCurrentPage('list')} updateStatus={updateStatus} clearMessages={clearMessages}/>;
     } else if (currentPage === 'profileChooser' && profileChoiceApp) {
-        pageContent = (
-            <Container maxWidth="sm" sx={{py: 4}}>
-                <Typography variant="h5" gutterBottom>{t('Choose Profile for {{appName}}', {appName: profileChoiceApp.name})}</Typography>
-                {profileChoiceApp.profiles?.length > 0 ? (
-                    <>
-                        <FormControl fullWidth sx={{my: 2}}>
-                            <InputLabel id="profile-select-label">{t('Profile')}</InputLabel>
-                            <Select labelId="profile-select-label" value={selectedProfileForInstall} label={t('Profile')} onChange={(e) => setSelectedProfileForInstall(e.target.value)}>
-                                {profileChoiceApp.profiles.map(p => <MenuItem key={p.name} value={p.name}>{p.name}</MenuItem>)}
-                            </Select>
-                        </FormControl>
-                        <Stack direction="row" spacing={2} sx={{mt: 3, justifyContent: 'flex-end'}}>
-                            <Button variant="outlined" onClick={() => setCurrentPage('list')}>{t('Cancel')}</Button>
-                            <Button variant="contained" onClick={() => handleInstallWithProfile(profileChoiceApp.name, selectedProfileForInstall)} disabled={!selectedProfileForInstall || busy}>
-                                {busy ? t("Starting Install...") : t("Confirm & Install")}
-                            </Button>
-                        </Stack>
-                    </>
-                ) : (
-                    <>
-                        <Typography sx={{my: 2}}>{t("No profiles available.")}</Typography>
-                        <Button variant="outlined" onClick={() => setCurrentPage('list')}>{t('Back')}</Button>
-                    </>
-                )}
-            </Container>
-        );
+        pageContent = <ProfileSelectPage app={profileChoiceApp}
+            title={t('Choose Profile for {{appName}}', {appName: profileChoiceApp.name})}
+            selectLabel={t('Profile')} selectedProfile={selectedProfileForInstall} onSelectProfile={setSelectedProfileForInstall}
+            confirmLabel={t('Confirm & Install')} busyLabel={t('Starting Install...')} isBusy={busy}
+            onConfirm={() => void handleInstallWithProfile(profileChoiceApp.name, selectedProfileForInstall)}
+            onCancel={() => setCurrentPage('list')} emptyBackLabel={t('Back')}/>;
     } else if (currentPage === 'changeProfile' && appForProfileChange) {
-        pageContent = (
-            <Container maxWidth="sm" sx={{py: 4}}>
-                <Typography variant="h5" gutterBottom>{t('Change Profile for {{appName}}', {appName: appForProfileChange.name})}</Typography>
-                <Typography variant="subtitle1" gutterBottom>{t('Current Profile: {{profile}}', {profile: appForProfileChange.current_profile})}</Typography>
-                {appForProfileChange.profiles?.length > 0 ? (
-                    <>
-                        <FormControl fullWidth sx={{my: 2}}>
-                            <InputLabel id="change-profile-select-label">{t('New Profile')}</InputLabel>
-                            <Select labelId="change-profile-select-label" value={selectedNewProfileName} label={t('New Profile')} onChange={(e) => setSelectedNewProfileName(e.target.value)}>
-                                {appForProfileChange.profiles.map(p => <MenuItem key={p.name} value={p.name} disabled={p.name === appForProfileChange.current_profile}>{p.name}{p.name === appForProfileChange.current_profile && t(" (Current)")}</MenuItem>)}
-                            </Select>
-                        </FormControl>
-                        <Stack direction="row" spacing={2} sx={{mt: 3, justifyContent: 'flex-end'}}>
-                            <Button variant="outlined" onClick={() => setCurrentPage('list')}>{t('Cancel')}</Button>
-                            <Button variant="contained" onClick={() => handleConfirmProfileChange(appForProfileChange.name, selectedNewProfileName)} disabled={!selectedNewProfileName || selectedNewProfileName === appForProfileChange.current_profile || busy}>
-                                {busy ? t("Initiating...") : t("Change Profile")}
-                            </Button>
-                        </Stack>
-                    </>
-                ) : <Typography sx={{my: 2}}>{t("No profiles available.")}</Typography>}
-            </Container>
-        );
-
+        pageContent = <ProfileSelectPage app={appForProfileChange}
+            title={t('Change Profile for {{appName}}', {appName: appForProfileChange.name})}
+            subtitle={t('Current Profile: {{profile}}', {profile: appForProfileChange.current_profile})}
+            selectLabel={t('New Profile')} currentProfile={appForProfileChange.current_profile}
+            selectedProfile={selectedNewProfileName} onSelectProfile={setSelectedNewProfileName}
+            confirmLabel={t('Change Profile')} busyLabel={t('Initiating...')} isBusy={busy}
+            onConfirm={() => handleConfirmProfileChange(appForProfileChange.name, selectedNewProfileName)}
+            onCancel={() => setCurrentPage('list')}/>;
     } else {
         pageContent = <Container maxWidth="lg" sx={{py: isInlineConsoleVisible ? 2 : {xs: 2, md: 4}, height: isInlineConsoleVisible ? '100vh' : 'auto', boxSizing: 'border-box', overflow: isInlineConsoleVisible ? 'hidden' : 'visible'}}>
             {status.loading && !app && <Card variant="outlined" sx={{borderColor: 'divider', boxShadow: 'none'}}><CardContent sx={{display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 220}}><CircularProgress size={24}/><Typography sx={{ml: 1.5}} color="text.secondary">{t('Loading app...')}</Typography></CardContent></Card>}

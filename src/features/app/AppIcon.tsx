@@ -1,12 +1,23 @@
-import {useEffect, useState} from 'react';
-import {invoke} from '@tauri-apps/api/core';
-import {Box} from '@mui/material';
-type AppIconAsset = {
-    bytes: number[];
-    mime_type: string;
+import {useEffect, useState} from "react";
+import {invoke} from "@tauri-apps/api/core";
+import {Box} from "@mui/material";
+
+// Mirrors icon_mime_type in src-tauri/src/app_service.rs; keep in sync.
+const ICON_MIME_TYPES: Record<string, string> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    svg: 'image/svg+xml',
+    bmp: 'image/bmp',
+    ico: 'image/x-icon',
 };
 
-export default function AppIcon({appName, iconPath}: {appName: string; iconPath: string}) {
+const iconMimeType = (iconPath: string): string | undefined =>
+    ICON_MIME_TYPES[iconPath.trim().split('.').pop()?.toLowerCase() ?? ''];
+
+export default function AppIcon({appName, iconPath}: { appName: string; iconPath: string }) {
     const [src, setSrc] = useState<string | null>(null);
 
     useEffect(() => {
@@ -14,17 +25,15 @@ export default function AppIcon({appName, iconPath}: {appName: string; iconPath:
         let objectUrl: string | null = null;
         setSrc(null);
 
-        if (!iconPath?.trim()) return;
+        const mimeType = iconPath?.trim() ? iconMimeType(iconPath) : undefined;
+        if (!mimeType) return;
 
-        invoke<AppIconAsset | null>('get_app_icon', {appName})
-            .then((asset) => {
-                if (!asset) return;
-                objectUrl = URL.createObjectURL(new Blob([new Uint8Array(asset.bytes)], {type: asset.mime_type}));
-                if (disposed) {
-                    URL.revokeObjectURL(objectUrl);
-                } else {
-                    setSrc(objectUrl);
-                }
+        // The backend returns raw bytes (an ArrayBuffer); empty means no usable icon.
+        invoke<ArrayBuffer>('get_app_icon', {appName})
+            .then((bytes) => {
+                if (disposed || bytes.byteLength === 0) return;
+                objectUrl = URL.createObjectURL(new Blob([bytes], {type: mimeType}));
+                setSrc(objectUrl);
             })
             .catch(() => {
                 if (!disposed) setSrc(null);

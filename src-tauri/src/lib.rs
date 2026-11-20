@@ -1,6 +1,7 @@
 // src/lib.rs
 mod app;
 mod app_service;
+mod changelog;
 mod config_manager;
 mod emitter;
 mod execute_python;
@@ -9,6 +10,7 @@ mod frozen;
 mod git;
 mod mirror;
 pub use frozen::packaging;
+mod pip_mirror;
 mod python_env;
 mod runas;
 mod source_switch;
@@ -47,6 +49,8 @@ struct CommandLineOptions {
     number_versions: Option<usize>,
     release_only: Option<bool>,
     update_to_version: Option<String>,
+    get_pip_index_url: bool,
+    set_pip_index_url: Option<String>,
     response_file: Option<PathBuf>,
 }
 
@@ -66,8 +70,14 @@ impl CommandLineOptions {
         self.release_only.unwrap_or(true)
     }
 
+    fn requests_pip_index_url(&self) -> bool {
+        self.get_pip_index_url || self.set_pip_index_url.is_some()
+    }
+
     fn has_forwardable_request(&self) -> bool {
-        self.requests_version_list() || self.update_to_version.is_some()
+        self.requests_version_list()
+            || self.update_to_version.is_some()
+            || self.requests_pip_index_url()
     }
 }
 
@@ -99,6 +109,20 @@ fn parse_command_line(args: &[String]) -> Result<CommandLineOptions, String> {
             "--get-version-list" | "--get_version_list" => {
                 options.command = Some("get-version-list".to_string());
                 i += 1;
+                continue;
+            }
+            "--get-pip-index-url" | "--get_pip_index_url" => {
+                options.get_pip_index_url = true;
+                i += 1;
+                continue;
+            }
+            "--set-pip-index-url" | "--set_pip_index_url" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| format!("Missing value for {}", flag))?;
+                options.set_pip_index_url = Some(value.clone());
+                i += 2;
                 continue;
             }
             "--include-prerelease" | "--include_prerelease" => {
@@ -246,7 +270,9 @@ fn parse_command_line(args: &[String]) -> Result<CommandLineOptions, String> {
 }
 
 fn has_cli_command(options: &CommandLineOptions) -> bool {
-    options.command.as_deref() == Some("setup") || options.requests_version_list()
+    options.command.as_deref() == Some("setup")
+        || options.requests_version_list()
+        || options.requests_pip_index_url()
 }
 
 #[derive(serde::Serialize)]
@@ -329,7 +355,9 @@ async fn execute_forwardable_request(options: &CommandLineOptions) -> (String, b
         let mut auto_start_lock = AUTO_START_CHECKED.lock().await;
         *auto_start_lock = true;
     }
-    let result = if options.requests_version_list() {
+    let result = if options.requests_pip_index_url() {
+        config_manager::execute_pip_index_url_request(options.set_pip_index_url.as_deref())
+    } else if options.requests_version_list() {
         execute_version_list_request(options).await
     } else {
         execute_update_request(options).await
@@ -355,7 +383,7 @@ async fn handle_command_line(options: CommandLineOptions) {
         let mut auto_start_lock = AUTO_START_CHECKED.lock().await;
         *auto_start_lock = true;
     }
-    if options.requests_version_list() {
+    if options.requests_version_list() || options.requests_pip_index_url() {
         let (json, success) = execute_forwardable_request(&options).await;
         if let Err(write_error) = write_cli_response(options.response_file.as_ref(), &json).await {
             eprintln!("{}", error_json(&write_error));
@@ -433,6 +461,15 @@ fn forward_to_running_instance(
         ))
     });
     let mut forwarded_args = args.to_vec();
+    for i in 1..forwarded_args.len() {
+        if matches!(
+            forwarded_args[i - 1].as_str(),
+            "--set-pip-index-url" | "--set_pip_index_url"
+        ) && forwarded_args[i].is_empty()
+        {
+            forwarded_args[i] = "default".to_string();
+        }
+    }
     if options.response_file.is_none() {
         forwarded_args.push("--response-file".to_string());
         forwarded_args.push(response_file.to_string_lossy().into_owned());
@@ -504,6 +541,26 @@ pub async fn run() {
     let command_line_options = match parse_command_line(&command_line_args) {
         Ok(options) => options,
         Err(error) => {
+            if command_line_args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--get-pip-index-url"
+                        | "--get_pip_index_url"
+                        | "--set-pip-index-url"
+                        | "--set_pip_index_url"
+                )
+            }) {
+                let json = error_json(&error);
+                let response_file = command_line_args
+                    .windows(2)
+                    .find(|pair| matches!(pair[0].as_str(), "--response-file" | "--response_file"))
+                    .map(|pair| PathBuf::from(&pair[1]));
+                if let Err(write_error) = write_cli_response(response_file.as_ref(), &json).await {
+                    eprintln!("{}", error_json(&write_error));
+                }
+                println!("{json}");
+                std::process::exit(1);
+            }
             eprintln!("{}", error);
             std::process::exit(2);
         }
@@ -747,6 +804,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_pip_index_url_requests() {
+        for flag in ["--get-pip-index-url", "--get_pip_index_url"] {
+            let parsed = parse_command_line(&args(&["pyappify", flag])).unwrap();
+            assert!(parsed.get_pip_index_url);
+            assert!(parsed.has_forwardable_request());
+            assert!(has_cli_command(&parsed));
+        }
+        for flag in ["--set-pip-index-url", "--set_pip_index_url"] {
+            for value in ["https://pypi.org/simple/", "default", ""] {
+                let parsed = parse_command_line(&args(&["pyappify", flag, value])).unwrap();
+                assert_eq!(parsed.set_pip_index_url.as_deref(), Some(value));
+                assert!(parsed.has_forwardable_request());
+                assert!(has_cli_command(&parsed));
+            }
+            assert_eq!(
+                parse_command_line(&args(&["pyappify", flag])).unwrap_err(),
+                format!("Missing value for {flag}")
+            );
+            assert!(parse_command_line(&args(&[
+                "pyappify",
+                flag,
+                "--response-file",
+                "result.json"
+            ]))
+            .is_err());
+        }
+    }
+
+    #[test]
     fn parses_temporary_startup_overrides() {
         let parsed = parse_command_line(&args(&[
             "pyappify",
@@ -770,6 +856,8 @@ mod tests {
                 number_versions: None,
                 release_only: None,
                 update_to_version: None,
+                get_pip_index_url: false,
+                set_pip_index_url: None,
                 response_file: None,
             }
         );

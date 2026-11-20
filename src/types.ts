@@ -12,7 +12,6 @@ export interface MessagePayload {
 export interface MirrorProgress { operation_id?: string | null; phase: string; downloaded: number; total: number | null; }
 export interface Task extends Operation { logs: MessagePayload[]; progress?: MirrorProgress & {value: number}; action: VersionActionType; notes?: string; }
 export type SettingsRequest = <T>(operation: () => Promise<T>) => Promise<T>;
-export type ThemeModeSetting = 'light' | 'dark' | 'system';
 export type StatusState = {loading?: boolean; error?: string | null; info?: string | null; messageLoading?: boolean};
 export type VersionProposal = {version: string; actionType: VersionActionType};
 export interface Profile {
@@ -50,3 +49,15 @@ export interface App {
     current_profile: string;
     show_add_defender: boolean;
 }
+
+export const UPDATE_METHOD_OPTIONS = [
+    'MANUAL_UPDATE',
+    'AUTO_UPDATE',
+    'AUTO_UPDATE_PRE_RELEASE',
+] as const;
+
+/** The app's current profile if it still exists, else its first profile. */
+export const pickInitialProfile = (app: App, fallback: string): string =>
+    app.profiles?.some(p => p.name === app.current_profile)
+        ? app.current_profile
+        : app.profiles?.[0]?.name || fallback;

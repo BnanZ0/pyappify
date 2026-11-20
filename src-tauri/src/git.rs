@@ -1,5 +1,7 @@
-use crate::extensions::cancellation;
 //git.rs
+use crate::changelog;
+use crate::extensions::cancellation;
+use crate::utils::path::get_working_dir_for_repo;
 use crate::{app::App, emit_info, emit_update_info, submodule};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -10,105 +12,224 @@ use git2::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use tokio::{sync::Mutex, task};
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard},
+    task,
+};
 use tracing::{debug, info, warn};
 
 const MAX_UPDATE_NOTE_LINES: usize = 10;
+
+/// `{language: notes}` for every launcher language, from an app's changelogs.
+pub type LocalizedNotes = BTreeMap<String, Vec<String>>;
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct VersionHistoryEntry {
     pub version: String,
     pub previous_version: Option<String>,
     pub update_note: Vec<String>,
+    /// The changelog's notes in every language, when the version has them, so
+    /// an app can show its own language rather than the launcher's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localized_notes: Option<LocalizedNotes>,
 }
 
 static REPO_LOCKS: Lazy<DashMap<PathBuf, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
 static GIT_CONFIG_INITIALIZED: OnceLock<()> = OnceLock::new();
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum Prerelease {
-    Alpha(Option<u64>),
-    Beta(Option<u64>),
-    Rc(Option<u64>),
-    Release,
+/// Serializes all git operations on one repository path.
+async fn lock_repo(repo_path: &Path) -> OwnedMutexGuard<()> {
+    let lock = REPO_LOCKS
+        .entry(repo_path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    lock.lock_owned().await
 }
 
-impl Prerelease {
-    fn rank(&self) -> u8 {
-        match self {
-            Self::Alpha(_) => 0,
-            Self::Beta(_) => 1,
-            Self::Rc(_) => 2,
-            Self::Release => 3,
-        }
-    }
-
-    fn number(&self) -> Option<u64> {
-        match self {
-            Self::Alpha(number) | Self::Beta(number) | Self::Rc(number) => *number,
-            Self::Release => None,
-        }
-    }
-
-    fn is_release(&self) -> bool {
-        matches!(self, Self::Release)
-    }
+/// Force-checks out `obj` and detaches HEAD at the commit it points to.
+fn checkout_detached(repo: &Repository, obj: &git2::Object<'_>, label: &str) -> Result<Oid> {
+    with_checkout_retries(label, || {
+        repo.checkout_tree(obj, Some(CheckoutBuilder::new().force()))
+    })?;
+    let commit_oid = obj
+        .peel_to_commit()
+        .map_or_else(|_| obj.id(), |commit| commit.id());
+    repo.set_head_detached(commit_oid)
+        .with_context(|| format!("Failed to set head detached to {commit_oid} for {label}"))?;
+    Ok(commit_oid)
 }
 
-impl Ord for Prerelease {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.rank()
-            .cmp(&other.rank())
-            .then_with(|| self.number().cmp(&other.number()))
-    }
+fn resolve_tag_commit(repo: &Repository, tag: &str) -> Result<Oid> {
+    Ok(repo
+        .revparse_single(&format!("refs/tags/{tag}"))
+        .with_context(|| format!("Failed to resolve version tag '{tag}'"))?
+        .peel_to_commit()
+        .with_context(|| format!("Failed to peel version tag '{tag}' to a commit"))?
+        .id())
 }
 
-impl PartialOrd for Prerelease {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+/// Version tags, parsed and ordered the same way as the UI (src/versions.ts),
+/// pyappify-action (versions.js) and pyappify-python (pyappify/versions.py):
+///
+/// `[prefix] [v] N[.N[.N[.N]]] [prerelease word [number]]`
+///
+/// - prefix: a name ending in `-`, `_` or `/` (`release-`, `app-v`, `app/`), ignored for ordering.
+/// - one to four number parts; missing parts count as 0 (`v1.2` == `v1.2.0`). A single
+///   number needs the `v` (`v5`, `app-v5`), so plain numbers, `pr/7` and commit
+///   hashes are no versions.
+/// - the prerelease word may follow with or without `-`, `.` or `_`, and so may its number:
+///   `1.2.3-beta.2`, `1.2.3b2`, `1.2.3rc1`, `1.2.3-preview`, `1.2.3.post1`, in any case.
+///   dev < alpha (a) < beta (b) < any other word < rc (c, pre, preview) < release < post.
+///   A missing prerelease number sorts before any number.
+static VERSION_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^([A-Za-z][A-Za-z0-9_.-]*?[-_/])??([vV])?(\d+(?:\.\d+){0,3})(?:[-._]?([A-Za-z]+)(?:[-._]?(\d+))?)?$",
+    )
+    .unwrap()
+});
+const OTHER_RANK: u8 = 3;
+const RELEASE_RANK: u8 = 5;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct VersionKey {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    prerelease: Prerelease,
+    parts: [u64; 4],
+    rank: u8,
+    number: Option<u64>,
+    /// The prerelease word when it is none of the known ones, else empty.
+    word: String,
+}
+
+impl VersionKey {
+    fn is_release(&self) -> bool {
+        self.rank >= RELEASE_RANK
+    }
+}
+
+fn word_rank(word: &str) -> u8 {
+    match word {
+        "dev" => 0,
+        "alpha" | "a" => 1,
+        "beta" | "b" => 2,
+        "rc" | "c" | "pre" | "preview" => 4,
+        "post" => 6,
+        _ => OTHER_RANK,
+    }
+}
+
+/// Without version tags, an app's versions are its most recent commits on the
+/// default branch, newest first, named by their first `COMMIT_VERSION_LENGTH`
+/// hex digits (like pyappify-action and pyappify-python). All count as releases.
+pub const RECENT_COMMIT_VERSIONS: usize = 30;
+const COMMIT_VERSION_LENGTH: usize = 7;
+/// Where the remote's default branch (its HEAD) is fetched to.
+const DEFAULT_BRANCH_REF: &str = "refs/pyappify/default-branch";
+
+/// A commit version: 7 to 40 hex digits that are no version tag.
+pub fn is_commit_version(version: &str) -> bool {
+    (COMMIT_VERSION_LENGTH..=40).contains(&version.len())
+        && version.chars().all(|c| c.is_ascii_hexdigit())
+        && !is_version_tag(version)
+}
+
+fn commit_version_name(oid: Oid) -> String {
+    oid.to_string()[..COMMIT_VERSION_LENGTH].to_string()
+}
+
+/// Fetches the remote's default branch to `DEFAULT_BRANCH_REF`.
+fn fetch_default_branch(repo: &Repository, app_name: &str) -> Result<()> {
+    fetch_from_origin(
+        repo,
+        app_name,
+        &[format!("+HEAD:{DEFAULT_BRANCH_REF}")],
+        None,
+        false,
+        Some("Fetching the default branch"),
+    )
+}
+
+/// The `RECENT_COMMIT_VERSIONS` most recent commits of the fetched default branch
+/// (else of HEAD), newest first, with their version names.
+fn recent_commit_versions(repo: &Repository) -> Result<Vec<(String, Oid)>> {
+    let tip = match repo.refname_to_id(DEFAULT_BRANCH_REF) {
+        Ok(oid) => oid,
+        Err(_) => repo
+            .head()
+            .context("Failed to get repo HEAD")?
+            .target()
+            .context("HEAD has no target OID")?,
+    };
+    let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
+    revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+    revwalk
+        .push(tip)
+        .with_context(|| format!("Failed to walk from commit {tip}"))?;
+    let mut commits = Vec::new();
+    for oid in revwalk.take(RECENT_COMMIT_VERSIONS) {
+        let oid = oid.context("Failed to walk the commit history")?;
+        commits.push((commit_version_name(oid), oid));
+    }
+    Ok(commits)
+}
+
+/// Whether `candidate` is newer than `current` among `available_versions`
+/// (newest first for commit versions).
+pub fn is_newer_version(available_versions: &[String], candidate: &str, current: &str) -> bool {
+    if is_commit_version(candidate) || is_commit_version(current) {
+        let position = |version: &str| available_versions.iter().position(|v| v == version);
+        return match (position(candidate), position(current)) {
+            (Some(candidate), Some(current)) => candidate < current,
+            (Some(_), None) => true,
+            _ => false,
+        };
+    }
+    compare_version_tags(candidate, current) == Some(Ordering::Greater)
+}
+
+/// The version part of a version tag, without its name prefix and `v`
+/// (`release-v1.2.0` -> `1.2.0`), or None if it is not a version tag.
+pub fn version_without_prefix(tag_name: &str) -> Option<&str> {
+    parse_version_tag(tag_name)?;
+    let start = VERSION_REGEX.captures(tag_name)?.get(3)?.start();
+    Some(&tag_name[start..])
 }
 
 fn parse_version_tag(tag_name: &str) -> Option<VersionKey> {
-    static VERSION_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^v?(\d+)\.(\d+)\.(\d+)(?:(?:-|\.)(alpha|beta|rc)(?:\.(\d+))?)?$").unwrap()
-    });
-
     let caps = VERSION_REGEX.captures(tag_name)?;
-    let major = caps.get(1)?.as_str().parse::<u64>().ok()?;
-    let minor = caps.get(2)?.as_str().parse::<u64>().ok()?;
-    let patch = caps.get(3)?.as_str().parse::<u64>().ok()?;
-    let prerelease_number = caps
+    let numbers = caps
+        .get(3)?
+        .as_str()
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if numbers.len() == 1 && caps.get(2).is_none() {
+        return None;
+    }
+    let mut parts = [0; 4];
+    parts[..numbers.len()].copy_from_slice(&numbers);
+    let word = caps
+        .get(4)
+        .map(|m| m.as_str().to_ascii_lowercase())
+        .unwrap_or_default();
+    let rank = if word.is_empty() {
+        RELEASE_RANK
+    } else {
+        word_rank(&word)
+    };
+    let number = caps
         .get(5)
         .map(|m| m.as_str().parse::<u64>())
         .transpose()
         .ok()?;
-    let prerelease = match caps.get(4).map(|m| m.as_str()) {
-        Some("alpha") => Prerelease::Alpha(prerelease_number),
-        Some("beta") => Prerelease::Beta(prerelease_number),
-        Some("rc") => Prerelease::Rc(prerelease_number),
-        None => Prerelease::Release,
-        _ => return None,
-    };
-
     Some(VersionKey {
-        major,
-        minor,
-        patch,
-        prerelease,
+        parts,
+        rank,
+        number,
+        word: if rank == OTHER_RANK { word } else { String::new() },
     })
 }
 
@@ -122,7 +243,7 @@ pub fn is_version_tag(tag_name: &str) -> bool {
 
 pub fn is_release_version(tag_name: &str) -> bool {
     parse_version_tag(tag_name)
-        .map(|version| version.prerelease.is_release())
+        .map(|version| version.is_release())
         .unwrap_or(false)
 }
 
@@ -175,9 +296,12 @@ fn create_proxy_options() -> ProxyOptions<'static> {
     proxy_opts
 }
 
+/// With `all_tags`, every remote tag is downloaded along with the refspecs;
+/// otherwise only the refspecs are.
 fn create_fetch_options(
     callbacks: RemoteCallbacks<'static>,
     depth: Option<u32>,
+    all_tags: bool,
 ) -> FetchOptions<'static> {
     let mut fo = FetchOptions::new();
     fo.remote_callbacks(callbacks);
@@ -185,15 +309,322 @@ fn create_fetch_options(
     if let Some(d) = depth {
         fo.depth(d as i32);
     }
-    fo.download_tags(git2::AutotagOption::All);
+    fo.download_tags(if all_tags {
+        git2::AutotagOption::All
+    } else {
+        git2::AutotagOption::None
+    });
     fo
 }
 
+/// Fetches `refspecs` from `origin`, reporting transfer progress under
+/// `progress_prefix` when given.
+fn fetch_from_origin(
+    repo: &Repository,
+    app_name: &str,
+    refspecs: &[String],
+    depth: Option<u32>,
+    all_tags: bool,
+    progress_prefix: Option<&str>,
+) -> Result<()> {
+    cancellation::ensure_app_operation_not_cancelled()?;
+    let mut remote = repo
+        .find_remote("origin")
+        .context("Failed to find remote 'origin'")?;
+    let remote_url = remote.url().ok().map(String::from);
+    let mut callbacks = RemoteCallbacks::new();
+    configure_credentials(&mut callbacks, remote_url.as_deref());
+    if let Some(prefix) = progress_prefix {
+        callbacks.transfer_progress(create_transfer_progress_callback(
+            app_name.to_string(),
+            prefix,
+            false,
+        ));
+    } else if let Some(token) = cancellation::current_token(app_name) {
+        callbacks.transfer_progress(move |_| token.git_progress());
+    }
+    let mut fetch_options = create_fetch_options(callbacks, depth, all_tags);
+    fetch_options.prune(git2::FetchPrune::On);
+    let refspecs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+    let result = remote
+        .fetch(&refspecs, Some(&mut fetch_options), None)
+        .with_context(|| {
+            format!(
+                "Failed to fetch {} from {}",
+                refspecs.join(" "),
+                remote_url.as_deref().unwrap_or("origin")
+            )
+        });
+    if progress_prefix.is_some() {
+        emit_update_info!(app_name, "");
+    }
+    cancellation::git_result(app_name, result)
+}
+
+fn tag_refspec(tag: &str) -> String {
+    format!("+refs/tags/{0}:refs/tags/{0}", tag)
+}
+
+/// Repository config key holding the app's `keep_releases`, so every git
+/// operation on the repository (and the Python package's standalone updater)
+/// applies it without needing the app's configuration.
+const KEEP_RELEASES_CONFIG_KEY: &str = "pyappify.keepreleases";
+/// Shallow clones start at this depth and deepen until the history between
+/// the kept releases is complete.
+const SHALLOW_START_DEPTH: u32 = 100;
+const SHALLOW_MAX_DEPTH: u32 = 25_600;
+
+/// The number of releases the repository keeps, or `None` to keep every tag.
+fn keep_releases(repo: &Repository) -> Option<usize> {
+    let value = repo.config().ok()?.get_i64(KEEP_RELEASES_CONFIG_KEY).ok()?;
+    usize::try_from(value).ok().filter(|keep| *keep > 0)
+}
+
+fn set_keep_releases(repo: &Repository, keep: Option<usize>) -> Result<()> {
+    if keep_releases(repo) == keep {
+        return Ok(());
+    }
+    let mut config = repo.config().context("Failed to open repository config")?;
+    match keep {
+        Some(keep) => config
+            .set_i64(KEEP_RELEASES_CONFIG_KEY, keep as i64)
+            .with_context(|| format!("Failed to set {KEEP_RELEASES_CONFIG_KEY}")),
+        None => match config.remove(KEEP_RELEASES_CONFIG_KEY) {
+            Err(error) if error.code() != ErrorCode::NotFound => Err(anyhow::Error::new(error)
+                .context(format!("Failed to remove {KEEP_RELEASES_CONFIG_KEY}"))),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The version tags to keep: the `keep` newest releases and the prereleases
+/// newer than the oldest of them, newest first. With fewer releases than
+/// `keep`, every version tag is kept.
+fn select_kept_tags<'a>(tags: impl IntoIterator<Item = &'a str>, keep: usize) -> Vec<String> {
+    let mut versions: Vec<(VersionKey, &str)> = tags
+        .into_iter()
+        .filter_map(|tag| parse_version_tag(tag).map(|key| (key, tag)))
+        .collect();
+    versions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let mut kept = Vec::new();
+    let mut releases = 0;
+    for (key, tag) in versions {
+        if releases >= keep {
+            break;
+        }
+        if key.is_release() {
+            releases += 1;
+        }
+        kept.push(tag.to_string());
+    }
+    kept
+}
+
+/// The tags pointing at the checked-out commit.
+fn head_tags(repo: &Repository) -> Vec<String> {
+    let Some(head) = repo.head().ok().and_then(|head| head.target()) else {
+        return Vec::new();
+    };
+    repo.tag_names(None)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|tag| tag.ok().flatten())
+                .filter(|tag| resolve_tag_commit(repo, tag).ok() == Some(head))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The local tags to keep given the remote's tags: all of them, or with
+/// `keep_releases` the kept versions, the tag being checked out (`extra`) and
+/// the tags of the checked-out version.
+fn tags_to_keep(
+    repo: &Repository,
+    remote_tags: &HashSet<String>,
+    extra: Option<&str>,
+) -> HashSet<String> {
+    let Some(keep) = keep_releases(repo) else {
+        return remote_tags.clone();
+    };
+    let mut kept: HashSet<String> = select_kept_tags(remote_tags.iter().map(String::as_str), keep)
+        .into_iter()
+        .collect();
+    kept.extend(
+        head_tags(repo)
+            .into_iter()
+            .chain(extra.map(String::from))
+            .filter(|tag| remote_tags.contains(tag)),
+    );
+    kept
+}
+
+/// True for a repository without an `origin` remote, such as one packaged from
+/// local files without a `git_url`. Its tags are only the local ones.
+fn is_local_only(repo: &Repository) -> Result<bool> {
+    Ok(get_repository_origin_url(repo)?.is_none())
+}
+
+/// Fetches the remote's tags (and branches with `include_heads`) and removes
+/// local tags that are not kept, see [`tags_to_keep`]. With `keep_releases`,
+/// only the kept tags are fetched and branches are skipped. A local-only
+/// repository has nothing to fetch and keeps its tags.
+fn sync_tags(
+    repo: &Repository,
+    app_name: &str,
+    include_heads: bool,
+    progress_prefix: Option<&str>,
+) -> Result<()> {
+    if is_local_only(repo)? {
+        debug!("{} has no origin remote; using its local tags.", repo.path().display());
+        return Ok(());
+    }
+    let remote_tags = list_remote_tags(repo)?;
+    if keep_releases(repo).is_some() {
+        let mut kept: Vec<String> = tags_to_keep(repo, &remote_tags, None).into_iter().collect();
+        kept.sort();
+        let refspecs: Vec<String> = kept.iter().map(|tag| tag_refspec(tag)).collect();
+        if !refspecs.is_empty() {
+            fetch_from_origin(repo, app_name, &refspecs, None, false, progress_prefix)?;
+        }
+        return prune_local_tags(repo, app_name, &kept.into_iter().collect());
+    }
+    let mut refspecs = vec!["+refs/tags/*:refs/tags/*".to_string()];
+    if include_heads {
+        refspecs.insert(0, "+refs/heads/*:refs/remotes/origin/*".to_string());
+    }
+    fetch_from_origin(repo, app_name, &refspecs, None, true, progress_prefix)?;
+    prune_local_tags(repo, app_name, &remote_tags)
+}
+
+/// Removes local tags the remote no longer has, or with `keep_releases` the
+/// ones that are not kept. `extra` names a tag that must stay.
+fn prune_tags(repo: &Repository, app_name: &str, extra: Option<&str>) -> Result<()> {
+    if is_local_only(repo)? {
+        return Ok(());
+    }
+    let remote_tags = list_remote_tags(repo)?;
+    prune_local_tags(repo, app_name, &tags_to_keep(repo, &remote_tags, extra))
+}
+
+/// The commits listed in the repository's `shallow` file: the commits whose
+/// parents were not fetched.
+fn shallow_roots(repo: &Repository) -> HashSet<Oid> {
+    fs::read_to_string(repo.path().join("shallow"))
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| Oid::from_str(line.trim()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the history between the kept tags (newest first) is complete, so
+/// update notes between them can be read: walking from the kept tags down to
+/// the oldest one reaches no commit whose parents are missing.
+fn kept_history_complete(repo: &Repository, kept: &[String]) -> Result<bool> {
+    let roots = shallow_roots(repo);
+    let Some(oldest) = kept.last() else {
+        return Ok(true);
+    };
+    if roots.is_empty() {
+        return Ok(true);
+    }
+    let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
+    for tag in kept {
+        revwalk.push(resolve_tag_commit(repo, tag)?)?;
+    }
+    revwalk.hide(resolve_tag_commit(repo, oldest)?)?;
+    for oid in revwalk {
+        match oid {
+            Ok(oid) if roots.contains(&oid) => return Ok(false),
+            Ok(_) => {}
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Creates the bare repository at `repo_path` with only the kept releases of
+/// `url` and as much history as their update notes need. Returns `None`, with
+/// nothing created, when the remote has no version tags.
+fn clone_kept_releases(
+    url: &str,
+    repo_path: &Path,
+    app_name: &str,
+    keep: usize,
+) -> Result<Option<Repository>> {
+    init_git_options();
+    let repo = Repository::init_bare(repo_path)
+        .with_context(|| format!("Failed to create repository at {}", repo_path.display()))?;
+    repo.remote("origin", url)
+        .with_context(|| format!("Failed to add remote {url}"))?;
+    set_keep_releases(&repo, Some(keep))?;
+    let remote_tags = list_remote_tags(&repo)?;
+    let kept = select_kept_tags(remote_tags.iter().map(String::as_str), keep);
+    if kept.is_empty() {
+        drop(repo);
+        fs::remove_dir_all(repo_path)
+            .with_context(|| format!("Failed to remove {}", repo_path.display()))?;
+        return Ok(None);
+    }
+    emit_info!(
+        app_name,
+        "Fetching the {} newest version(s) of {} releases kept.",
+        kept.len(),
+        keep
+    );
+    let refspecs: Vec<String> = kept.iter().map(|tag| tag_refspec(tag)).collect();
+    let mut depth = SHALLOW_START_DEPTH;
+    loop {
+        let roots_before = shallow_roots(&repo);
+        // One tag per fetch: a shallow fetch of several tags at once can
+        // stall in libgit2. After the newest tag, the others are mostly
+        // already present and quick to fetch.
+        for refspec in &refspecs {
+            let fetch = || {
+                fetch_from_origin(
+                    &repo,
+                    app_name,
+                    std::slice::from_ref(refspec),
+                    Some(depth),
+                    false,
+                    Some("Receiving objects"),
+                )
+            };
+            if let Err(error) = fetch() {
+                cancellation::ensure_app_operation_not_cancelled()?;
+                warn!("Fetching {} failed, retrying once: {:#}", refspec, error);
+                fetch()?;
+            }
+        }
+        if kept_history_complete(&repo, &kept)? {
+            break;
+        }
+        if depth >= SHALLOW_MAX_DEPTH || shallow_roots(&repo) == roots_before {
+            warn!(
+                "History between the kept releases of {} is still incomplete at depth {}.",
+                app_name, depth
+            );
+            break;
+        }
+        depth *= 4;
+        debug!("Deepening {} to depth {}", app_name, depth);
+    }
+    Ok(Some(repo))
+}
+
+/// Emits throttled (0.1%) transfer progress. With `detailed`, also reports
+/// received bytes and indexed objects, which is useful for initial clones.
 fn create_transfer_progress_callback(
     app_name: String,
-    prefix: String,
+    prefix: &str,
+    detailed: bool,
 ) -> impl FnMut(Progress<'_>) -> bool + 'static {
     let token = cancellation::current_token(&app_name);
+    let prefix = prefix.to_string();
     let mut last_percent = -1.0;
     move |progress: Progress| {
         if token.as_ref().is_some_and(|token| !token.git_progress()) {
@@ -201,22 +632,38 @@ fn create_transfer_progress_callback(
         }
         let received_objects = progress.received_objects();
         let total_objects = progress.total_objects();
+        let detail = if detailed {
+            format!(
+                "({}), indexing {} objects... ",
+                format_bytes(progress.received_bytes()),
+                progress.indexed_objects()
+            )
+        } else {
+            String::new()
+        };
         if total_objects > 0 {
             let current_percent = (received_objects as f64 * 100.0) / total_objects as f64;
             let rounded_percent = (current_percent * 10.0).round() / 10.0;
             if (rounded_percent - last_percent).abs() >= 0.1 || received_objects == total_objects {
                 emit_update_info!(
                     app_name,
-                    "\r{}: {:.1}% ({} / {}) ",
+                    "\r{}: {:.1}% ({} / {}) {}",
                     prefix,
                     rounded_percent,
                     received_objects,
-                    total_objects
+                    total_objects,
+                    detail
                 );
                 last_percent = rounded_percent;
             }
         } else {
-            emit_update_info!(app_name, "\r{}: {} received... ", prefix, received_objects);
+            emit_update_info!(
+                app_name,
+                "\r{}: {} received... {}",
+                prefix,
+                received_objects,
+                detail
+            );
         }
         io::stdout().flush().unwrap_or_default();
         true
@@ -238,36 +685,169 @@ fn get_sorted_tags_by_time(repo: &Repository) -> Result<Vec<String>> {
         }
     }
 
-    version_tags.sort_by(|a, b| b.0.cmp(&a.0));
+    version_tags.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     let sorted_tags = version_tags.into_iter().map(|(_, tag)| tag).collect();
     Ok(sorted_tags)
 }
 
-fn collect_commit_messages_between_tags(
-    repo: &Repository,
-    previous_tag: Option<&str>,
-    target_tag: &str,
-) -> Result<Vec<String>> {
-    let target_commit = repo
-        .revparse_single(&format!("refs/tags/{target_tag}"))
-        .with_context(|| format!("Failed to resolve target version tag '{target_tag}'"))?
-        .peel_to_commit()
-        .with_context(|| format!("Failed to peel target version tag '{target_tag}'"))?;
+/// `{commit: [version tag, ...]}`, each list newest first.
+fn version_tags_by_commit(repo: &Repository) -> Result<HashMap<Oid, Vec<String>>> {
+    let mut tags: HashMap<Oid, Vec<String>> = HashMap::new();
+    for tag in get_sorted_tags_by_time(repo)? {
+        if let Ok(oid) = resolve_tag_commit(repo, &tag) {
+            tags.entry(oid).or_default().push(tag);
+        }
+    }
+    Ok(tags)
+}
 
+/// The text of `path` in commit `oid`, or None if it does not exist.
+fn read_file_at_commit(repo: &Repository, oid: Oid, path: &str) -> Option<String> {
+    let tree = repo.find_commit(oid).ok()?.tree().ok()?;
+    let entry = tree.get_path(Path::new(path)).ok()?;
+    let blob = repo.find_blob(entry.id()).ok()?;
+    Some(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+/// `{language: notes}` for moving to `target_oid`, or None without a changelog.
+///
+/// A language's notes come from the changelogs in `target_oid` (see
+/// [`changelog`]) when its version tag has an entry in that language or in
+/// English: the entries of every version tag reachable from `target_oid` but
+/// not from `hidden_oid`, newest first, or the target's own when nothing is (a
+/// downgrade). Other languages get `commit_notes()`. None when no language has
+/// an entry.
+fn changelog_notes(
+    repo: &Repository,
+    target_oid: Oid,
+    hidden_oid: Option<Oid>,
+    tags_by_commit: &HashMap<Oid, Vec<String>>,
+    commit_notes: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Option<LocalizedNotes>> {
+    let Some(target_versions) = tags_by_commit.get(&target_oid) else {
+        return Ok(None);
+    };
+    let changelogs: HashMap<&str, changelog::Changelog> = changelog::LANGUAGES
+        .iter()
+        .filter_map(|language| {
+            read_file_at_commit(repo, target_oid, &changelog::changelog_path(language))
+                .map(|text| (*language, changelog::parse_changelog(&text)))
+        })
+        .collect();
+    let empty = changelog::Changelog::new();
+    let english = changelogs.get(changelog::ENGLISH).unwrap_or(&empty);
+    let languages: Vec<&str> = changelog::LANGUAGES
+        .iter()
+        .copied()
+        .filter(|language| {
+            let localized = changelogs.get(language).unwrap_or(&empty);
+            target_versions
+                .iter()
+                .any(|version| changelog::has_entry(localized, english, version))
+        })
+        .collect();
+    if languages.is_empty() {
+        return Ok(None);
+    }
+
+    let mut versions = target_versions.clone();
     let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
     revwalk
-        .push(target_commit.id())
-        .with_context(|| format!("Failed to walk target version tag '{target_tag}'"))?;
-    if let Some(previous_tag) = previous_tag {
-        let previous_commit = repo
-            .revparse_single(&format!("refs/tags/{previous_tag}"))
-            .with_context(|| format!("Failed to resolve previous version tag '{previous_tag}'"))?
-            .peel_to_commit()
-            .with_context(|| format!("Failed to peel previous version tag '{previous_tag}'"))?;
+        .push(target_oid)
+        .with_context(|| format!("Failed to walk from commit {target_oid}"))?;
+    if let Some(hidden_oid) = hidden_oid {
         revwalk
-            .hide(previous_commit.id())
-            .with_context(|| format!("Failed to hide previous version tag '{previous_tag}'"))?;
+            .hide(hidden_oid)
+            .with_context(|| format!("Failed to hide commit {hidden_oid}"))?;
+    }
+    revwalk
+        .set_sorting(Sort::TIME)
+        .context("Failed to sort changelog commits")?;
+    for oid in revwalk {
+        let oid = oid.context("Error iterating changelog commits")?;
+        if oid != target_oid {
+            if let Some(tags) = tags_by_commit.get(&oid) {
+                versions.extend(tags.iter().cloned());
+            }
+        }
+    }
+
+    let mut commit_notes = Some(commit_notes);
+    let mut fallback: Option<Vec<String>> = None;
+    let mut notes = LocalizedNotes::new();
+    for language in changelog::LANGUAGES {
+        let language_notes = if languages.contains(&language) {
+            let localized = changelogs.get(language).unwrap_or(&empty);
+            changelog::notes_for_versions(localized, english, &versions)
+        } else {
+            if fallback.is_none() {
+                fallback = Some(commit_notes.take().map_or(Ok(Vec::new()), |notes| notes())?);
+            }
+            fallback.clone().unwrap_or_default()
+        };
+        notes.insert(language.to_string(), language_notes);
+    }
+    Ok(Some(notes))
+}
+
+/// The notes for `language` from [`changelog_notes`], and all of them; or
+/// `commit_notes()` and None when the target has no changelog entry.
+fn notes_in_language(
+    repo: &Repository,
+    target_oid: Oid,
+    hidden_oid: Option<Oid>,
+    language: &str,
+    tags_by_commit: &HashMap<Oid, Vec<String>>,
+    commit_notes: impl Fn() -> Result<Vec<String>>,
+) -> Result<(Vec<String>, Option<LocalizedNotes>)> {
+    match changelog_notes(repo, target_oid, hidden_oid, tags_by_commit, &commit_notes) {
+        Ok(Some(localized)) => {
+            let notes = localized
+                .get(language)
+                .or_else(|| localized.get(changelog::ENGLISH))
+                .cloned()
+                .unwrap_or_default();
+            return Ok((notes, Some(localized)));
+        }
+        Ok(None) => {}
+        Err(error) => warn!("Could not read changelog notes for {target_oid}: {error:#}"),
+    }
+    Ok((commit_notes()?, None))
+}
+
+/// Notes for moving to `target_oid` in `language`: the changelog's when it has
+/// an entry for the target's version, else commit messages.
+#[cfg(test)]
+fn update_notes(
+    repo: &Repository,
+    target_oid: Oid,
+    hidden_oid: Option<Oid>,
+    language: &str,
+    tags_by_commit: &HashMap<Oid, Vec<String>>,
+) -> Result<Vec<String>> {
+    notes_in_language(repo, target_oid, hidden_oid, language, tags_by_commit, || {
+        collect_commit_messages(repo, target_oid, hidden_oid)
+    })
+    .map(|(notes, _)| notes)
+}
+
+/// Collects up to `MAX_UPDATE_NOTE_LINES` unique, non-empty message lines from
+/// non-merge commits reachable from `target_oid` but not from `hidden_oid`,
+/// newest first.
+fn collect_commit_messages(
+    repo: &Repository,
+    target_oid: Oid,
+    hidden_oid: Option<Oid>,
+) -> Result<Vec<String>> {
+    let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
+    revwalk
+        .push(target_oid)
+        .with_context(|| format!("Failed to walk from commit {target_oid}"))?;
+    if let Some(hidden_oid) = hidden_oid {
+        revwalk
+            .hide(hidden_oid)
+            .with_context(|| format!("Failed to hide commit {hidden_oid}"))?;
     }
     revwalk
         .set_sorting(Sort::TIME)
@@ -306,23 +886,48 @@ fn build_version_history(
     repo: &Repository,
     number_versions: usize,
     release_only: bool,
+    language: &str,
 ) -> Result<Vec<VersionHistoryEntry>> {
-    let tags = get_sorted_tags_by_time(repo)?
-        .into_iter()
-        .filter(|tag| !release_only || is_release_version(tag))
-        .collect::<Vec<_>>();
+    let all_tags = get_sorted_tags_by_time(repo)?;
+    // Without version tags the versions are the recent commits, all releases.
+    let versions: Vec<(String, Oid)> = if all_tags.is_empty() {
+        recent_commit_versions(repo)?
+    } else {
+        all_tags
+            .into_iter()
+            .filter(|tag| !release_only || is_release_version(tag))
+            .map(|tag| resolve_tag_commit(repo, &tag).map(|oid| (tag, oid)))
+            .collect::<Result<_>>()?
+    };
+    let tags_by_commit = version_tags_by_commit(repo)?;
 
-    tags.iter()
+    versions
+        .iter()
         .take(number_versions)
         .enumerate()
-        .map(|(index, version)| {
-            let previous_version = tags.get(index + 1).cloned();
-            let update_note =
-                collect_commit_messages_between_tags(repo, previous_version.as_deref(), version)?;
+        .map(|(index, (version, target_oid))| {
+            let target_oid = *target_oid;
+            let previous = versions.get(index + 1);
+            let previous_version = previous.map(|(version, _)| version.clone());
+            // The oldest listed commit shows only its own message.
+            let hidden_oid = previous.map(|(_, oid)| *oid).or_else(|| {
+                is_commit_version(version)
+                    .then(|| repo.find_commit(target_oid).ok()?.parent_id(0).ok())
+                    .flatten()
+            });
+            let (update_note, localized_notes) = notes_in_language(
+                repo,
+                target_oid,
+                hidden_oid,
+                language,
+                &tags_by_commit,
+                || collect_commit_messages(repo, target_oid, hidden_oid),
+            )?;
             Ok(VersionHistoryEntry {
                 version: version.clone(),
                 previous_version,
                 update_note,
+                localized_notes,
             })
         })
         .collect()
@@ -332,17 +937,15 @@ pub async fn get_version_history(
     repo_path: &Path,
     number_versions: usize,
     release_only: bool,
+    language: &str,
 ) -> Result<Vec<VersionHistoryEntry>> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
     let repo_path = repo_path.to_path_buf();
+    let language = language.to_string();
 
     task::spawn_blocking(move || {
         let repo = open_repository(&repo_path)?;
-        build_version_history(&repo, number_versions, release_only)
+        build_version_history(&repo, number_versions, release_only, &language)
     })
     .await
     .context("Task for get_version_history panicked or was cancelled")?
@@ -378,17 +981,16 @@ fn collect_remote_tag_names(
     Ok(remote_tags)
 }
 
-fn prune_deleted_local_tags_from_remote(
-    repo: &Repository,
-    remote_name: &str,
-    app_name: &str,
-) -> Result<()> {
+fn list_remote_tags(repo: &Repository) -> Result<HashSet<String>> {
     let mut remote = repo
-        .find_remote(remote_name)
-        .with_context(|| format!("Failed to find remote '{}' for tag pruning", remote_name))?;
+        .find_remote("origin")
+        .context("Failed to find remote 'origin' for listing tags")?;
     let remote_url = remote.url().ok().map(String::from);
-    let remote_tags = collect_remote_tag_names(&mut remote, remote_url.as_deref())?;
+    collect_remote_tag_names(&mut remote, remote_url.as_deref())
+}
 
+/// Deletes the local tags that are not in `keep`.
+fn prune_local_tags(repo: &Repository, app_name: &str, keep: &HashSet<String>) -> Result<()> {
     let local_tag_array = repo
         .tag_names(None)
         .with_context(|| format!("Failed to list local tags from {:?}", repo.path()))?;
@@ -401,7 +1003,7 @@ fn prune_deleted_local_tags_from_remote(
 
     let mut pruned_count = 0;
     for tag_name in local_tags {
-        if remote_tags.contains(&tag_name) {
+        if keep.contains(&tag_name) {
             continue;
         }
 
@@ -414,7 +1016,7 @@ fn prune_deleted_local_tags_from_remote(
                 pruned_count += 1;
                 emit_info!(
                     app_name,
-                    "Pruned local tag '{}' because it no longer exists on remote.",
+                    "Pruned local tag '{}': it is gone from the remote or older than the kept releases.",
                     tag_name
                 );
             }
@@ -430,7 +1032,7 @@ fn prune_deleted_local_tags_from_remote(
 
     if pruned_count > 0 {
         info!(
-            "Pruned {} local tag(s) for {} that no longer exist on remote.",
+            "Pruned {} local tag(s) for {} that are gone from the remote or not kept.",
             pruned_count, app_name
         );
     }
@@ -438,15 +1040,194 @@ fn prune_deleted_local_tags_from_remote(
     Ok(())
 }
 
-pub fn open_repository(repo_path: &Path) -> Result<Repository> {
+/// A network read that receives nothing for this long fails instead of
+/// stalling the fetch forever (libgit2 waits indefinitely by default).
+const SERVER_TIMEOUT_MS: i32 = 60_000;
+
+fn init_git_options() {
     GIT_CONFIG_INITIALIZED.get_or_init(|| {
         unsafe {
             let _ = opts::set_verify_owner_validation(false);
+            if let Err(error) = opts::set_server_timeout_in_milliseconds(SERVER_TIMEOUT_MS) {
+                warn!("Failed to set the git server timeout: {}", error);
+            }
         }
         debug!("git2 owner validation disabled for this process.");
     });
-    Repository::open(repo_path)
-        .with_context(|| format!("Failed to open local repo at {}", repo_path.display()))
+}
+
+/// Opens an app repository.
+///
+/// App repositories are bare: `repo` holds only git data and the app's files
+/// live in the `working` folder next to it, which is set as the work tree
+/// here (in memory, so nothing absolute is written and no `.git` link is put
+/// into `working`). Checkouts then update `working` directly: files the app
+/// created there are kept, and only files removed between versions are
+/// deleted. A non-bare repository is opened as is.
+pub fn open_repository(repo_path: &Path) -> Result<Repository> {
+    init_git_options();
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("Failed to open local repo at {}", repo_path.display()))?;
+    if repo.is_bare() {
+        let work_tree = get_working_dir_for_repo(repo_path);
+        fs::create_dir_all(&work_tree)
+            .with_context(|| format!("Failed to create {}", work_tree.display()))?;
+        repo.set_workdir(&work_tree, false).with_context(|| {
+            format!(
+                "Failed to use {} as the work tree of {}",
+                work_tree.display(),
+                repo_path.display()
+            )
+        })?;
+    }
+    Ok(repo)
+}
+
+/// Converts an app installed with the old layout, where `repo` was a full
+/// clone whose files were copied into `working`, into a bare `repo` that
+/// checks out into `working` directly. Safe to rerun after an interruption.
+///
+/// The old index describes exactly the files that were copied into
+/// `working`, so it is kept as the baseline for the next checkout.
+fn migrate_to_bare_layout(app_name: &str, repo_path: &Path) -> Result<()> {
+    let git_dir = repo_path.join(".git");
+    let moved_git_dir = repo_path.with_file_name("repo.git.migrating");
+    let old_checkout = repo_path.with_file_name("repo.checkout.old");
+
+    if git_dir.is_dir() {
+        emit_info!(
+            app_name,
+            "Moving {} to the shared-checkout layout (git data in repo, app files in working)...",
+            repo_path.display()
+        );
+        // Mark it bare before it is opened again, or libgit2 would treat its
+        // parent folder as the work tree.
+        git2::Config::open(&git_dir.join("config"))
+            .and_then(|mut config| config.set_bool("core.bare", true))
+            .with_context(|| format!("Failed to mark {} as bare", git_dir.display()))?;
+        fs::rename(&git_dir, &moved_git_dir).with_context(|| {
+            format!(
+                "Failed to move {} to {}",
+                git_dir.display(),
+                moved_git_dir.display()
+            )
+        })?;
+    }
+    if moved_git_dir.is_dir() {
+        if repo_path.exists() {
+            if old_checkout.exists() {
+                fs::remove_dir_all(&old_checkout).with_context(|| {
+                    format!("Failed to remove {}", old_checkout.display())
+                })?;
+            }
+            fs::rename(repo_path, &old_checkout).with_context(|| {
+                format!(
+                    "Failed to move {} to {}",
+                    repo_path.display(),
+                    old_checkout.display()
+                )
+            })?;
+        }
+        fs::rename(&moved_git_dir, repo_path).with_context(|| {
+            format!(
+                "Failed to move {} to {}",
+                moved_git_dir.display(),
+                repo_path.display()
+            )
+        })?;
+    }
+    if old_checkout.exists() {
+        match fs::remove_dir_all(&old_checkout) {
+            Ok(()) => {
+                emit_info!(
+                    app_name,
+                    "Removed the old duplicate checkout at {}.",
+                    old_checkout.display()
+                );
+            }
+            Err(error) => warn!(
+                "Could not remove the old checkout at {}: {}. It can be deleted manually.",
+                old_checkout.display(),
+                error
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Migrates an old-layout install (see [`migrate_to_bare_layout`]) and makes
+/// `working` match the checked-out commit.
+pub async fn ensure_bare_layout(app_name: &str, repo_path: &Path) -> Result<()> {
+    let _guard = lock_repo(repo_path).await;
+    let git_dir = repo_path.join(".git");
+    let moved_git_dir = repo_path.with_file_name("repo.git.migrating");
+    if !git_dir.is_dir() && !moved_git_dir.is_dir() {
+        return Ok(());
+    }
+    let app_name = app_name.to_string();
+    let repo_path = repo_path.to_path_buf();
+    task::spawn_blocking(move || -> Result<()> {
+        migrate_to_bare_layout(&app_name, &repo_path)?;
+        let repo = open_repository(&repo_path)?;
+        checkout_head_into_work_tree(&repo, &app_name, "migrated repository")?;
+        emit_info!(app_name, "Repository layout migration complete.");
+        Ok(())
+    })
+    .await
+    .context("Task for ensure_bare_layout panicked or was cancelled")?
+}
+
+fn checkout_head_into_work_tree(repo: &Repository, app_name: &str, label: &str) -> Result<()> {
+    with_checkout_retries(label, || {
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))
+    })?;
+    submodule::update_repository_submodules(repo, app_name, label)
+}
+
+/// Makes the app's work tree match the commit checked out in its repository,
+/// restoring missing or modified tracked files and leaving other files alone.
+pub async fn checkout_head_to_working(app_name: &str, repo_path: &Path) -> Result<()> {
+    let _guard = lock_repo(repo_path).await;
+    let app_name = app_name.to_string();
+    let repo_path = repo_path.to_path_buf();
+    task::spawn_blocking(move || -> Result<()> {
+        let repo = open_repository(&repo_path)?;
+        checkout_head_into_work_tree(
+            &repo,
+            &app_name,
+            &format!("work tree of {}", repo_path.display()),
+        )
+    })
+    .await
+    .context("Task for checkout_head_to_working panicked or was cancelled")?
+}
+
+const CHECKOUT_ATTEMPTS: u32 = 3;
+
+/// Retries a checkout a few times, since files in the work tree can be
+/// briefly locked on Windows (antivirus, a process that is still exiting).
+fn with_checkout_retries(
+    label: &str,
+    mut checkout: impl FnMut() -> std::result::Result<(), GitError>,
+) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match checkout() {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < CHECKOUT_ATTEMPTS => {
+                warn!(
+                    "Checkout of {} failed (attempt {}/{}): {}. Retrying.",
+                    label, attempt, CHECKOUT_ATTEMPTS, error
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+                attempt += 1;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("Failed to checkout tree for {label}")))
+            }
+        }
+    }
 }
 
 pub fn get_repository_origin_url(repo: &Repository) -> Result<Option<String>> {
@@ -467,11 +1248,7 @@ pub async fn get_tags_and_current_version(
     app_name: &str,
     repo_path: PathBuf,
 ) -> Result<(Vec<String>, String)> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.clone())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(&repo_path).await;
 
     let app_name_for_task = app_name.to_string();
     let repo_path_for_task = repo_path.clone();
@@ -484,40 +1261,33 @@ pub async fn get_tags_and_current_version(
         );
 
         let repo = open_repository(&repo_path_for_task)?;
-
-        let mut remote = repo.find_remote("origin").with_context(|| {
+        sync_tags(&repo, &app_name_for_task, false, None).with_context(|| {
             format!(
-                "Failed to find remote 'origin' in repository {}",
+                "Failed to fetch tags for repository {}",
                 repo_path_for_task.display()
             )
         })?;
-
-        let remote_url = remote.url().ok().map(String::from);
-
-        let mut remote_callbacks = RemoteCallbacks::new();
-        configure_credentials(&mut remote_callbacks, remote_url.as_deref());
-
-        let mut fetch_options = create_fetch_options(remote_callbacks, None);
-        fetch_options.prune(git2::FetchPrune::On);
-
-        remote
-            .fetch(
-                &["+refs/tags/*:refs/tags/*"],
-                Some(&mut fetch_options),
-                None,
-            )
-            .with_context(|| {
-                format!(
-                    "Failed to fetch tags for repository {}",
-                    repo_path_for_task.display()
-                )
-            })?;
-        prune_deleted_local_tags_from_remote(&repo, "origin", &app_name_for_task)?;
 
         let sorted_tags = get_sorted_tags_by_time(&repo)?;
 
         let head_ref = repo.head().context("Failed to get repo HEAD")?;
         let head_oid = head_ref.target().context("HEAD has no target OID")?;
+
+        if sorted_tags.is_empty() {
+            emit_info!(
+                app_name_for_task,
+                "No version tags found. Listing the {} most recent commits as versions.",
+                RECENT_COMMIT_VERSIONS
+            );
+            if let Err(error) = fetch_default_branch(&repo, &app_name_for_task) {
+                warn!("Failed to fetch the default branch: {error:#}");
+            }
+            let commits = recent_commit_versions(&repo)?
+                .into_iter()
+                .map(|(version, _)| version)
+                .collect();
+            return Ok((commits, commit_version_name(head_oid)));
+        }
 
         let mut current_version_tag: Option<String> = None;
         for tag_name in &sorted_tags {
@@ -561,18 +1331,31 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 pub async fn ensure_repository(app: &App) -> Result<()> {
+    cancellation::ensure_app_operation_not_cancelled()?;
     let repo_path = app.get_repo_path();
-
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.clone())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    ensure_bare_layout(&app.name, &repo_path).await?;
+    let _guard = lock_repo(&repo_path).await;
 
     let profile = app.get_current_profile_settings();
     let url = profile.git_url.clone();
     let app_name = app.name.clone();
     info!("ensure_repository {} {}", app_name, &url);
+    if url.is_empty() {
+        // Packaged from local files: the bundled repository is the only source.
+        if repo_path.exists() && open_repository(&repo_path).is_ok() {
+            info!(
+                "No git_url for '{}'; using the bundled repository {} without fetching.",
+                app_name,
+                repo_path.display()
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "No git_url is set for '{}' and there is no bundled repository at {}",
+            app_name,
+            repo_path.display()
+        );
+    }
     emit_info!(app_name, "Clone {} from {}", app_name, &url);
 
     if repo_path.exists() {
@@ -595,42 +1378,21 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
                         format!("Failed to set remote url for {}", repo_path.display())
                     })?;
                 }
+                set_keep_releases(&repo, app.keep_releases)?;
 
                 emit_info!(app_name, "Fetching updates for existing repository...");
                 let repo_path_for_task = repo_path.clone();
-                let url_for_task = url.clone();
                 let app_name_for_task = app_name.clone();
 
                 task::spawn_blocking(move || -> Result<()> {
                     let repo = open_repository(&repo_path_for_task)?;
-                    let mut remote = repo.find_remote("origin")?;
-                    let mut callbacks = RemoteCallbacks::new();
-                    configure_credentials(&mut callbacks, Some(&url_for_task));
-
-                    let app_name_for_progress = app_name_for_task.clone();
-                    callbacks.transfer_progress(create_transfer_progress_callback(
-                        app_name_for_progress,
-                        "Fetching objects".to_string(),
-                    ));
-
-                    let mut fetch_options = create_fetch_options(callbacks, None);
-                    fetch_options.prune(git2::FetchPrune::On);
-                    let refspecs = [
-                        "+refs/heads/*:refs/remotes/origin/*",
-                        "+refs/tags/*:refs/tags/*",
-                    ];
-                    let fetch_result = remote
-                        .fetch(&refspecs, Some(&mut fetch_options), None)
+                    sync_tags(&repo, &app_name_for_task, true, Some("Fetching objects"))
                         .with_context(|| {
                             format!(
                                 "Failed to fetch updates for {}",
                                 repo_path_for_task.display()
                             )
-                        });
-
-                    emit_update_info!(app_name_for_task, "");
-                    cancellation::git_result(&app_name_for_task, fetch_result)?;
-                    prune_deleted_local_tags_from_remote(&repo, "origin", &app_name_for_task)?;
+                        })?;
                     emit_info!(app_name_for_task, "Fetch complete.");
                     Ok(())
                 })
@@ -657,70 +1419,55 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
     let repo_path_for_clone_task = repo_path.to_path_buf();
     let url_for_clone_task = url.to_string();
     let app_name_for_messages = app_name.to_string();
+    let keep = app.keep_releases;
 
     task::spawn_blocking(move || -> Result<()> {
-        let mut callbacks = RemoteCallbacks::new();
-        configure_credentials(&mut callbacks, Some(&url_for_clone_task));
-        let app_name_for_progress_clone = app_name_for_messages.clone();
-        let token = cancellation::current_token(&app_name_for_messages);
-        callbacks.transfer_progress({
-            let mut last_percent = -1.0;
-            move |progress: Progress| {
-                if token.as_ref().is_some_and(|token| !token.git_progress()) {
-                    return false;
-                }
-                let received_objects = progress.received_objects();
-                let total_objects = progress.total_objects();
-                let indexed_objects = progress.indexed_objects();
-                let received_bytes = progress.received_bytes();
-                if total_objects > 0 {
-                    let current_percent = (received_objects as f64 * 100.0) / total_objects as f64;
-                    let rounded_percent = (current_percent * 10.0).round() / 10.0;
-                    if (rounded_percent - last_percent).abs() >= 0.1 {
-                        emit_update_info!(
-                            app_name_for_progress_clone,
-                            "\rReceiving objects: {:.1}% ({} / {}) ({}), indexing {} objects... ",
-                            rounded_percent,
-                            received_objects,
-                            total_objects,
-                            format_bytes(received_bytes),
-                            indexed_objects
-                        );
-                        last_percent = rounded_percent;
-                    }
-                } else {
-                    emit_update_info!(
-                        app_name_for_progress_clone,
-                        "\rReceiving objects: {} received ({} bytes), indexing {} objects... ",
-                        received_objects,
-                        received_bytes,
-                        indexed_objects
-                    );
-                }
-                io::stdout().flush().unwrap_or_default();
-                true
-            }
-        });
-
-        let mut fetch_options = create_fetch_options(callbacks, None);
-        fetch_options.download_tags(git2::AutotagOption::All);
-
-        let mut builder = git2::build::RepoBuilder::new();
-        builder.fetch_options(fetch_options);
-        builder.bare(false);
-
         emit_info!(
             app_name_for_messages,
             "Attempting to clone {} into {}",
             url_for_clone_task,
             repo_path_for_clone_task.display()
         );
-        let repo = cancellation::git_result(
-            &app_name_for_messages,
-            builder
-                .clone(&url_for_clone_task, &repo_path_for_clone_task)
-                .with_context(|| format!("Git clone failed for {}", url_for_clone_task)),
-        )?;
+        let kept_clone = match keep {
+            Some(keep) => clone_kept_releases(
+                &url_for_clone_task,
+                &repo_path_for_clone_task,
+                &app_name_for_messages,
+                keep,
+            )
+            .map(|repo| repo.is_some())
+            .inspect_err(|_| {
+                let _ = fs::remove_dir_all(&repo_path_for_clone_task);
+            })
+            .with_context(|| format!("Git clone failed for {}", url_for_clone_task))?,
+            None => false,
+        };
+
+        if !kept_clone {
+            let mut callbacks = RemoteCallbacks::new();
+            configure_credentials(&mut callbacks, Some(&url_for_clone_task));
+            callbacks.transfer_progress(create_transfer_progress_callback(
+                app_name_for_messages.clone(),
+                "Receiving objects",
+                true,
+            ));
+
+            let fetch_options = create_fetch_options(callbacks, None, true);
+
+            // Bare: `repo` keeps only git data; files are checked out into `working`.
+            let mut builder = git2::build::RepoBuilder::new();
+            builder.fetch_options(fetch_options);
+            builder.bare(true);
+            cancellation::git_result(
+                &app_name_for_messages,
+                builder
+                    .clone(&url_for_clone_task, &repo_path_for_clone_task)
+                    .with_context(|| format!("Git clone failed for {}", url_for_clone_task)),
+            )?;
+        }
+        cancellation::ensure_app_operation_not_cancelled()?;
+        let repo = open_repository(&repo_path_for_clone_task)?;
+        set_keep_releases(&repo, keep)?;
 
         emit_info!(
             app_name_for_messages,
@@ -734,7 +1481,7 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
                 app_name_for_messages,
                 "No tags found. Repository will remain on default branch."
             );
-            submodule::update_repository_submodules(
+            checkout_head_into_work_tree(
                 &repo,
                 &app_name_for_messages,
                 &format!("repository at {}", repo_path_for_clone_task.display()),
@@ -761,20 +1508,7 @@ pub async fn ensure_repository(app: &App) -> Result<()> {
                     latest_tag_name
                 )
             })?;
-
-        repo.checkout_tree(&obj, Some(CheckoutBuilder::new().force()))
-            .with_context(|| format!("Failed to checkout tree for tag {}", latest_tag_name))?;
-
-        let commit_oid = obj
-            .peel_to_commit()
-            .map_or_else(|_| obj.id(), |commit| commit.id());
-
-        repo.set_head_detached(commit_oid).with_context(|| {
-            format!(
-                "Failed to set head detached to {} for tag {}",
-                commit_oid, latest_tag_name
-            )
-        })?;
+        checkout_detached(&repo, &obj, &format!("tag {latest_tag_name}"))?;
 
         emit_info!(
             app_name_for_messages,
@@ -803,11 +1537,7 @@ pub async fn checkout_version_tag(
     repo_path: &Path,
     version_tag_name: &str,
 ) -> Result<Oid> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
 
     let task_repo_path = repo_path.to_path_buf();
     let tag_to_checkout = version_tag_name.to_string();
@@ -816,42 +1546,76 @@ pub async fn checkout_version_tag(
     let oid = task::spawn_blocking(move || -> Result<Oid> {
         let repo = open_repository(&task_repo_path)?;
 
-        let mut remote = repo
-            .find_remote("origin")
-            .context("Failed to find remote 'origin'")?;
+        if is_commit_version(&tag_to_checkout)
+            && repo
+                .find_reference(&format!("refs/tags/{tag_to_checkout}"))
+                .is_err()
+        {
+            if !is_local_only(&repo)? {
+                if let Err(error) = fetch_default_branch(&repo, &app_name_for_task) {
+                    cancellation::ensure_app_operation_not_cancelled()?;
+                    warn!("Failed to fetch the default branch: {error:#}");
+                }
+            }
+            cancellation::ensure_app_operation_not_cancelled()?;
+            let obj = repo
+                .revparse_single(&tag_to_checkout)
+                .and_then(|obj| obj.peel(ObjectType::Commit))
+                .with_context(|| {
+                    format!(
+                        "Commit '{}' not found in repo {}",
+                        tag_to_checkout,
+                        task_repo_path.display()
+                    )
+                })?;
+            let commit_oid =
+                checkout_detached(&repo, &obj, &format!("commit {tag_to_checkout}"))?;
+            emit_info!(
+                app_name_for_task,
+                "Successfully checked out commit {} for repo {}.",
+                commit_oid,
+                task_repo_path.display()
+            );
+            submodule::update_repository_submodules(
+                &repo,
+                &app_name_for_task,
+                &format!(
+                    "repository at {} after checking out commit {}",
+                    task_repo_path.display(),
+                    tag_to_checkout
+                ),
+            )?;
+            return Ok(commit_oid);
+        }
 
-        let mut callbacks = RemoteCallbacks::new();
-        configure_credentials(&mut callbacks, remote.url().ok());
-
-        callbacks.transfer_progress(create_transfer_progress_callback(
-            app_name_for_task.clone(),
-            "Fetching objects for tag".to_string(),
-        ));
-
-        let mut fetch_options = create_fetch_options(callbacks, None);
-        fetch_options.prune(git2::FetchPrune::On);
-
-        let refspec = format!("+refs/tags/{0}:refs/tags/{0}", tag_to_checkout);
-        emit_info!(
-            app_name_for_task,
-            "Fetching refspec: {} for repo: {}",
-            refspec,
-            task_repo_path.display()
-        );
-        let fetch_result = remote
-            .fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
+        if !is_local_only(&repo)? {
+            let refspec = tag_refspec(&tag_to_checkout);
+            emit_info!(
+                app_name_for_task,
+                "Fetching refspec: {} for repo: {}",
+                refspec,
+                task_repo_path.display()
+            );
+            fetch_from_origin(
+                &repo,
+                &app_name_for_task,
+                &[refspec],
+                None,
+                keep_releases(&repo).is_none(),
+                Some("Fetching objects for tag"),
+            )
             .with_context(|| {
                 format!(
                     "Failed to fetch tag {} for repo {}",
                     tag_to_checkout,
                     task_repo_path.display()
                 )
-            });
-        emit_update_info!(app_name_for_task, "");
-        cancellation::git_result(&app_name_for_task, fetch_result)?;
-        prune_deleted_local_tags_from_remote(&repo, "origin", &app_name_for_task)?;
+            })?;
+            prune_tags(&repo, &app_name_for_task, Some(&tag_to_checkout))?;
 
-        debug!("Fetch successful for tag {}", tag_to_checkout);
+            debug!("Fetch successful for tag {}", tag_to_checkout);
+        }
+        cancellation::ensure_app_operation_not_cancelled()?;
 
         let obj = repo
             .revparse_single(&format!("refs/tags/{}", tag_to_checkout))
@@ -864,17 +1628,7 @@ pub async fn checkout_version_tag(
             })?;
 
         debug!("Revparsed tag {} to object {}", tag_to_checkout, obj.id());
-
-        repo.checkout_tree(&obj, Some(CheckoutBuilder::new().force()))
-            .with_context(|| format!("Failed to checkout tree for tag {}", tag_to_checkout))?;
-        debug!("Checkout tree successful for tag {}", tag_to_checkout);
-
-        let commit_oid = obj
-            .peel_to_commit()
-            .map_or_else(|_| obj.id(), |commit| commit.id());
-
-        repo.set_head_detached(commit_oid)
-            .with_context(|| format!("Failed to set head detached to {}", commit_oid))?;
+        let commit_oid = checkout_detached(&repo, &obj, &format!("tag {tag_to_checkout}"))?;
 
         emit_info!(
             app_name_for_task,
@@ -902,11 +1656,7 @@ pub async fn checkout_version_tag(
 }
 
 pub async fn get_current_head_oid(repo_path: &Path) -> Result<Oid> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
 
     let task_repo_path = repo_path.to_path_buf();
     let oid = task::spawn_blocking(move || -> Result<Oid> {
@@ -920,27 +1670,31 @@ pub async fn get_current_head_oid(repo_path: &Path) -> Result<Oid> {
     Ok(oid)
 }
 
+/// Resolves a revision (commit, branch or tag name) that already exists locally.
+fn find_local_revision<'r>(
+    repo: &'r Repository,
+    repo_path: &Path,
+    revision: &str,
+) -> Result<git2::Object<'r>> {
+    repo.revparse_single(revision)
+        .or_else(|_| repo.revparse_single(&format!("refs/tags/{revision}")))
+        .with_context(|| {
+            format!(
+                "Revision '{}' not found locally in repo {}",
+                revision,
+                repo_path.display()
+            )
+        })
+}
+
 pub async fn get_revision_oid(repo_path: &Path, revision: &str) -> Result<Oid> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
 
     let task_repo_path = repo_path.to_path_buf();
     let revision_to_resolve = revision.to_string();
     let oid = task::spawn_blocking(move || -> Result<Oid> {
         let repo = open_repository(&task_repo_path)?;
-        let object = repo
-            .revparse_single(&revision_to_resolve)
-            .or_else(|_| repo.revparse_single(&format!("refs/tags/{revision_to_resolve}")))
-            .with_context(|| {
-                format!(
-                    "Revision '{}' not found locally in repo {}",
-                    revision_to_resolve,
-                    task_repo_path.display()
-                )
-            })?;
+        let object = find_local_revision(&repo, &task_repo_path, &revision_to_resolve)?;
         Ok(object
             .peel_to_commit()
             .map_or_else(|_| object.id(), |commit| commit.id()))
@@ -955,11 +1709,7 @@ pub async fn checkout_existing_revision(
     repo_path: &Path,
     revision: &str,
 ) -> Result<Oid> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
 
     let task_repo_path = repo_path.to_path_buf();
     let revision_to_checkout = revision.to_string();
@@ -967,32 +1717,9 @@ pub async fn checkout_existing_revision(
 
     let oid = task::spawn_blocking(move || -> Result<Oid> {
         let repo = open_repository(&task_repo_path)?;
-
-        let obj = repo
-            .revparse_single(&revision_to_checkout)
-            .or_else(|_| repo.revparse_single(&format!("refs/tags/{}", revision_to_checkout)))
-            .with_context(|| {
-                format!(
-                    "Revision '{}' not found locally in repo {}",
-                    revision_to_checkout,
-                    task_repo_path.display()
-                )
-            })?;
-
-        repo.checkout_tree(&obj, Some(CheckoutBuilder::new().force()))
-            .with_context(|| {
-                format!(
-                    "Failed to checkout tree for revision {}",
-                    revision_to_checkout
-                )
-            })?;
-
-        let commit_oid = obj
-            .peel_to_commit()
-            .map_or_else(|_| obj.id(), |commit| commit.id());
-
-        repo.set_head_detached(commit_oid)
-            .with_context(|| format!("Failed to set head detached to {}", commit_oid))?;
+        let obj = find_local_revision(&repo, &task_repo_path, &revision_to_checkout)?;
+        let commit_oid =
+            checkout_detached(&repo, &obj, &format!("revision {revision_to_checkout}"))?;
 
         emit_info!(
             app_name_for_task,
@@ -1019,122 +1746,102 @@ pub async fn checkout_existing_revision(
     Ok(oid)
 }
 
+/// Commit-message notes for moving from `head_oid` to `target_commit_oid`,
+/// falling back to the target commit's own message when nothing new is
+/// reachable, for example on a downgrade.
+fn commit_notes_for_update(
+    repo: &Repository,
+    target_commit_oid: Oid,
+    head_oid: Oid,
+    target_tag: &str,
+) -> Result<Vec<String>> {
+    let mut messages = collect_commit_messages(repo, target_commit_oid, Some(head_oid))?;
+    info!(
+        "Found {} commit messages in diff from HEAD ({}) to target {} ({})",
+        messages.len(),
+        head_oid,
+        target_tag,
+        target_commit_oid
+    );
+
+    if messages.is_empty() {
+        let target_commit = repo.find_commit(target_commit_oid).with_context(|| {
+            format!("Failed to find target commit for OID {}", target_commit_oid)
+        })?;
+        if let Ok(full_message) = target_commit.message() {
+            info!(
+                "Diff is empty, using target commit's message: {}",
+                full_message.lines().next().unwrap_or("")
+            );
+            for line in full_message.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    messages.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    Ok(messages)
+}
+
+/// Notes for updating the checkout to `target_version_tag_name`, in `language`
+/// when the app's changelogs have them, else commit messages.
 pub async fn get_commit_messages_for_version_diff(
+    app_name: &str,
     repo_path: &Path,
     target_version_tag_name: &str,
+    language: &str,
 ) -> Result<Vec<String>> {
-    let lock_arc = REPO_LOCKS
-        .entry(repo_path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = lock_arc.lock().await;
+    let _guard = lock_repo(repo_path).await;
 
+    let app_name = app_name.to_string();
     let repo_path_clone = repo_path.to_path_buf();
     let target_tag = target_version_tag_name.to_string();
+    let language = language.to_string();
 
     let messages = task::spawn_blocking(move || -> Result<Vec<String>> {
         let repo = open_repository(&repo_path_clone)?;
-        let mut remote = repo
-            .find_remote("origin")
-            .context("Failed to find remote 'origin'")?;
-
-        let mut callbacks = RemoteCallbacks::new();
-        configure_credentials(&mut callbacks, remote.url().ok());
-
-        let mut fetch_options = create_fetch_options(callbacks, None);
-
         let head_ref = repo.head().context("Failed to get repo HEAD")?;
         let head_oid = head_ref.target().context("HEAD has no target OID")?;
 
-        let target_tag_ref_str = format!("refs/tags/{}", target_tag);
-        if repo.find_reference(&target_tag_ref_str).is_err() {
-            let target_refspec = format!("+refs/tags/{0}:refs/tags/{0}", target_tag);
-            debug!(
-                "Fetching target tag {} as it's not found locally.",
+        let target_tag_ref = format!("refs/tags/{target_tag}");
+        let target_commit_oid = if is_commit_version(&target_tag)
+            && repo.find_reference(&target_tag_ref).is_err()
+        {
+            repo.revparse_single(&target_tag)?.peel_to_commit()?.id()
+        } else {
+            if repo.find_reference(&target_tag_ref).is_err() && !is_local_only(&repo)? {
+                fetch_from_origin(
+                    &repo,
+                    &app_name,
+                    &[tag_refspec(&target_tag)],
+                    None,
+                    keep_releases(&repo).is_none(),
+                    None,
+                )
+                .with_context(|| format!("Failed to fetch target version tag {}", target_tag))?;
+            }
+            resolve_tag_commit(&repo, &target_tag)?
+        };
+
+        let tags_by_commit = version_tags_by_commit(&repo)?;
+        let (notes, localized) = notes_in_language(
+            &repo,
+            target_commit_oid,
+            Some(head_oid),
+            &language,
+            &tags_by_commit,
+            || commit_notes_for_update(&repo, target_commit_oid, head_oid, &target_tag),
+        )?;
+        if localized.is_some() {
+            info!(
+                "Using {} changelog notes ({}) for target {}",
+                notes.len(),
+                language,
                 target_tag
             );
-            remote
-                .fetch(&[target_refspec.as_str()], Some(&mut fetch_options), None)
-                .with_context(|| format!("Failed to fetch target version tag {}", target_tag))?;
         }
-
-        let target_obj = repo.revparse_single(&target_tag_ref_str).with_context(|| {
-            format!(
-                "Target version tag '{}' not found locally after potential fetch",
-                target_tag
-            )
-        })?;
-
-        let target_commit_oid = target_obj
-            .peel_to_commit()
-            .with_context(|| format!("Failed to peel tag '{}' to a commit object", target_tag))?
-            .id();
-
-        let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
-        revwalk
-            .push(target_commit_oid)
-            .with_context(|| format!("Failed to push OID {} to revwalk", target_commit_oid))?;
-        revwalk
-            .hide(head_oid)
-            .with_context(|| format!("Failed to hide OID {} from revwalk", head_oid))?;
-        revwalk
-            .set_sorting(Sort::TIME)
-            .context("Failed to set revwalk sorting")?;
-
-        let mut messages = Vec::new();
-        let mut seen_messages = HashSet::new();
-        'revwalk: for oid_result in revwalk {
-            let oid = oid_result.context("Error iterating revwalk")?;
-            let commit = repo
-                .find_commit(oid)
-                .with_context(|| format!("Failed to find commit for OID {}", oid))?;
-
-            if commit.parent_count() > 1 {
-                continue;
-            }
-
-            if let Ok(full_message) = commit.message() {
-                for line in full_message.lines() {
-                    let trimmed_line = line.trim();
-                    if !trimmed_line.is_empty() {
-                        let msg_str = trimmed_line.to_string();
-                        if seen_messages.insert(msg_str.clone()) {
-                            messages.push(msg_str);
-                            if messages.len() >= 10 {
-                                break 'revwalk;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        info!(
-            "Found {} commit messages in diff from HEAD ({}) to target {} ({})",
-            messages.len(),
-            head_oid,
-            target_tag,
-            target_commit_oid
-        );
-
-        if messages.is_empty() {
-            let target_commit = repo.find_commit(target_commit_oid).with_context(|| {
-                format!("Failed to find target commit for OID {}", target_commit_oid)
-            })?;
-            if let Ok(full_message) = target_commit.message() {
-                info!(
-                    "Diff is empty, using target commit's message: {}",
-                    full_message.lines().next().unwrap_or("")
-                );
-                for line in full_message.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        messages.push(trimmed.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(messages)
+        Ok(notes)
     })
     .await
     .context("Task for get_commit_messages panicked or was cancelled")??;
@@ -1144,11 +1851,13 @@ pub async fn get_commit_messages_for_version_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_version_history, checkout_version_tag, compare_version_tags, is_release_version,
-        is_version_tag,
+        build_version_history, checkout_existing_revision, checkout_head_to_working,
+        checkout_version_tag, compare_version_tags, ensure_bare_layout, is_release_version,
+        is_version_tag, open_repository, resolve_tag_commit, update_notes, version_tags_by_commit,
     };
     use git2::{Repository, Signature};
     use std::cmp::Ordering;
+    use std::path::Path;
 
     fn commit_and_tag(repo: &Repository, root: &std::path::Path, tag: &str, message: &str) {
         let file_path = root.join("history.txt");
@@ -1180,6 +1889,303 @@ mod tests {
             .unwrap();
     }
 
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pyappify-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Writes (`Some`) or deletes (`None`) files, commits everything and tags it.
+    fn commit_files(
+        repo: &Repository,
+        root: &std::path::Path,
+        files: &[(&str, Option<&str>)],
+        tag: &str,
+    ) {
+        for (path, content) in files {
+            let file_path = root.join(path);
+            match content {
+                Some(content) => {
+                    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+                    std::fs::write(file_path, content).unwrap();
+                }
+                None => std::fs::remove_file(file_path).unwrap(),
+            }
+        }
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.update_all(["*"].iter(), None).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = Signature::now("PyAppify Test", "test@example.com").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap());
+        let parents = parent.iter().collect::<Vec<_>>();
+        let commit_id = repo
+            .commit(Some("HEAD"), &signature, &signature, tag, &tree, &parents)
+            .unwrap();
+        repo.tag_lightweight(tag, &repo.find_object(commit_id, None).unwrap(), false)
+            .unwrap();
+    }
+
+    fn bare_clone(source: &std::path::Path, repo_path: &std::path::Path) {
+        drop(
+            git2::build::RepoBuilder::new()
+                .bare(true)
+                .clone(source.to_str().unwrap(), repo_path)
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn without_version_tags_the_recent_commits_are_the_versions() {
+        let root = unique_temp_dir("commit-versions");
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        for message in ["First", "Second", "Third"] {
+            commit_and_tag(&source, &source_path, "scratch", message);
+            source.tag_delete("scratch").unwrap();
+        }
+        let repo_path = root.join("repo");
+        bare_clone(&source_path, &repo_path);
+        // A newer commit after the clone is fetched through the default branch.
+        commit_and_tag(&source, &source_path, "scratch", "Fourth");
+        source.tag_delete("scratch").unwrap();
+
+        let repo = open_repository(&repo_path).unwrap();
+        super::fetch_default_branch(&repo, "test").unwrap();
+        let versions = super::recent_commit_versions(&repo).unwrap();
+        let names: Vec<&str> = versions.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), 4);
+        assert!(names.iter().all(|name| super::is_commit_version(name)));
+        let head = source.head().unwrap().target().unwrap();
+        assert_eq!(names[0], &head.to_string()[..7]);
+
+        let history = build_version_history(&repo, 10, true, "en").unwrap();
+        let notes: Vec<Vec<String>> = history.iter().map(|entry| entry.update_note.clone()).collect();
+        assert_eq!(notes, [["Fourth"], ["Third"], ["Second"], ["First"]].map(|n| n.map(String::from).to_vec()));
+        assert_eq!(history[0].previous_version.as_deref(), Some(names[1]));
+        drop(repo);
+
+        let oid = checkout_version_tag("test", &repo_path, names[2]).await.unwrap();
+        assert_eq!(oid, versions[2].1);
+
+        let available: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        assert!(super::is_newer_version(&available, names[0], names[2]));
+        assert!(!super::is_newer_version(&available, names[2], names[0]));
+        assert!(super::is_newer_version(&available, names[0], "0123456"));
+        assert!(super::is_newer_version(&[], "v1.1.0", "v1.0.0"));
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[track_caller]
+    fn read(path: std::path::PathBuf) -> String {
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    #[tokio::test]
+    async fn bare_repository_checks_out_into_working_and_keeps_app_files() {
+        let root = unique_temp_dir("bare-layout");
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        commit_files(
+            &source,
+            &source_path,
+            &[("app.py", Some("v1")), ("pkg/old.py", Some("old"))],
+            "v1.0.0",
+        );
+        commit_files(
+            &source,
+            &source_path,
+            &[
+                ("app.py", Some("v2")),
+                ("pkg/old.py", None),
+                ("pkg/new.py", Some("new")),
+            ],
+            "v1.1.0",
+        );
+        let repo_path = root.join("app").join("repo");
+        let working = root.join("app").join("working");
+        bare_clone(&source_path, &repo_path);
+
+        checkout_version_tag("test", &repo_path, "v1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(read(working.join("app.py")), "v1");
+        assert!(!repo_path.join("app.py").exists(), "repo keeps git data only");
+        assert!(!working.join(".git").exists());
+
+        // Files the app creates, at the top level and in a tracked folder.
+        std::fs::write(working.join("settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(working.join("configs")).unwrap();
+        std::fs::write(working.join("configs/user.json"), "{}").unwrap();
+        std::fs::write(working.join("pkg/cache.bin"), "cache").unwrap();
+
+        checkout_version_tag("test", &repo_path, "v1.1.0")
+            .await
+            .unwrap();
+        assert_eq!(read(working.join("app.py")), "v2");
+        assert_eq!(read(working.join("pkg/new.py")), "new");
+        assert!(!working.join("pkg/old.py").exists(), "removed files are deleted");
+        assert_eq!(read(working.join("settings.json")), "{}");
+        assert_eq!(read(working.join("configs/user.json")), "{}");
+        assert_eq!(read(working.join("pkg/cache.bin")), "cache");
+
+        // A recreated or damaged working folder is restored from HEAD.
+        std::fs::remove_file(working.join("app.py")).unwrap();
+        std::fs::write(working.join("pkg/new.py"), "edited").unwrap();
+        checkout_head_to_working("test", &repo_path).await.unwrap();
+        assert_eq!(read(working.join("app.py")), "v2");
+        assert_eq!(read(working.join("pkg/new.py")), "new");
+        assert_eq!(read(working.join("settings.json")), "{}");
+
+        checkout_existing_revision("test", &repo_path, "v1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(read(working.join("pkg/old.py")), "old");
+        assert!(!working.join("pkg/new.py").exists());
+
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn copy_without_git(source: &std::path::Path, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_without_git(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migrates_old_layout_with_submodules() {
+        let root = unique_temp_dir("migrate-layout");
+        let module_source_path = root.join("templates");
+        let module_source = Repository::init(&module_source_path).unwrap();
+        commit_files(
+            &module_source,
+            &module_source_path,
+            &[("template.txt", Some("t1"))],
+            "t1",
+        );
+
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        let mut module = source
+            .submodule(
+                module_source_path.to_str().unwrap(),
+                std::path::Path::new("ok_templates"),
+                true,
+            )
+            .unwrap();
+        drop(module.clone(None).unwrap());
+        module.add_finalize().unwrap();
+        drop(module);
+        commit_files(&source, &source_path, &[("app.py", Some("v1"))], "v1.0.0");
+        commit_files(&source, &source_path, &[("app.py", Some("v2"))], "v1.1.0");
+
+        // The old layout: a full clone in `repo`, copied into `working`.
+        let repo_path = root.join("app").join("repo");
+        let working = root.join("app").join("working");
+        drop(Repository::clone(source_path.to_str().unwrap(), &repo_path).unwrap());
+        checkout_version_tag("test", &repo_path, "v1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(read(repo_path.join("ok_templates/template.txt")), "t1");
+        copy_without_git(&repo_path, &working);
+        std::fs::create_dir_all(working.join("configs")).unwrap();
+        std::fs::write(working.join("configs/user.json"), "{}").unwrap();
+
+        ensure_bare_layout("test", &repo_path).await.unwrap();
+
+        assert!(Repository::open(&repo_path).unwrap().is_bare());
+        assert!(!repo_path.join("app.py").exists());
+        assert!(!root.join("app").join("repo.checkout.old").exists());
+        assert!(!root.join("app").join("repo.git.migrating").exists());
+        assert_eq!(
+            read(working.join("ok_templates/.git")).trim(),
+            "gitdir: ../../repo/modules/ok_templates",
+            "the link is relative so the install can be moved"
+        );
+        assert_eq!(
+            git2::Config::open(&repo_path.join("modules/ok_templates/config"))
+                .unwrap()
+                .get_string("core.worktree")
+                .unwrap(),
+            "../../../working/ok_templates"
+        );
+        assert_eq!(read(working.join("ok_templates/template.txt")), "t1");
+        assert_eq!(read(working.join("configs/user.json")), "{}");
+        let (_, current) = {
+            let repo = open_repository(&repo_path).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            ((), head)
+        };
+        assert_eq!(current, resolve_tag_commit(&source, "v1.0.0").unwrap());
+        // Running it again is a no-op.
+        ensure_bare_layout("test", &repo_path).await.unwrap();
+
+        checkout_version_tag("test", &repo_path, "v1.1.0")
+            .await
+            .unwrap();
+        assert_eq!(read(working.join("app.py")), "v2");
+        assert_eq!(read(working.join("ok_templates/template.txt")), "t1");
+        assert_eq!(read(working.join("configs/user.json")), "{}");
+        let program = crate::frozen::program_files::ProgramFiles::git(&repo_path, Some("v1.1.0")).unwrap();
+        assert!(program.files.contains(&"ok_templates/template.txt".into()));
+        let new_body = root.join("mirror-body");
+        std::fs::create_dir_all(&new_body).unwrap();
+        crate::frozen::program_files::migrate_users(
+            &working, &new_body, &program,
+            &crate::frozen::program_files::ProgramFiles::new(Vec::new()).unwrap(),
+            || false,
+        ).unwrap();
+        assert_eq!(read(new_body.join("configs/user.json")), "{}");
+        assert!(!new_body.join("ok_templates/.git").exists());
+
+        // A recreated working folder gets its submodule back.
+        std::fs::remove_dir_all(&working).unwrap();
+        checkout_head_to_working("test", &repo_path).await.unwrap();
+        assert_eq!(read(working.join("app.py")), "v2");
+        assert_eq!(read(working.join("ok_templates/template.txt")), "t1");
+
+        // A fresh install (bare clone) gets the submodule cloned into working.
+        let fresh_repo_path = root.join("fresh").join("repo");
+        let fresh_working = root.join("fresh").join("working");
+        bare_clone(&source_path, &fresh_repo_path);
+        checkout_version_tag("test", &fresh_repo_path, "v1.1.0")
+            .await
+            .unwrap();
+        assert_eq!(read(fresh_working.join("ok_templates/template.txt")), "t1");
+        assert!(fresh_repo_path.join("modules/ok_templates/HEAD").is_file());
+        assert!(!fresh_repo_path.join("ok_templates").exists());
+
+        drop(source);
+        drop(module_source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn compares_release_and_prerelease_versions() {
         let ordered = [
@@ -1208,6 +2214,42 @@ mod tests {
         assert!(!is_version_tag("7fa243f331892d478c4e450f6215495ca3b48258"));
     }
 
+    // Shared with pyappify-action (versions.test.js) and pyappify-python (TestVersion.py).
+    #[test]
+    fn accepts_unconventional_version_tags_and_rejects_names_and_hashes() {
+        for tag in [
+            "v1.2.3", "1.2.3", "V1.2.3", "v1.2", "1.2", "v1", "v1.2.3.4", "2026.11.17",
+            "v1.2.3-beta", "v1.2.3.rc.2", "v1.2.3-beta.2", "1.2.3b2", "1.2.3rc1", "1.2.3-RC1",
+            "1.2.3-preview", "1.2.3.dev4", "1.2.3_alpha_1", "1.2.3.post1", "1.2.3-hotfix",
+            "release-1.2.3", "app-v1.2.3", "app/v1.2.3-beta.1", "my_app_1.0", "app-v5",
+        ] {
+            assert!(is_version_tag(tag), "{tag}");
+        }
+        for tag in [
+            "", "latest", "main", "1", "2024", "1234567", "a1b2c3d", "1234e56",
+            "v1.2.3.4.5", "1.2.3-", "-1.2.3", "v", "release", "release-", "1..2", "build-5",
+            "pr/7", "local/feature",
+        ] {
+            assert!(!is_version_tag(tag), "{tag}");
+        }
+        let ascending = [
+            "v1.0.0", "v1.2", "1.2.0.1", "v1.2.3.dev1", "v1.2.3a1", "v1.2.3-alpha.2",
+            "v1.2.3-beta", "v1.2.3b1", "v1.2.3-beta.2", "v1.2.3-hotfix", "v1.2.3-preview",
+            "v1.2.3rc1", "v1.2.3", "v1.2.3.post1", "release-1.3", "app-v2",
+        ];
+        for pair in ascending.windows(2) {
+            assert_eq!(compare_version_tags(pair[0], pair[1]), Some(Ordering::Less), "{pair:?}");
+        }
+        assert_eq!(compare_version_tags("v1.2", "1.2.0"), Some(Ordering::Equal));
+        for tag in ["v1.2.3", "1.2", "release-1.2.3", "1.2.3.post1", "v1"] {
+            assert!(is_release_version(tag), "{tag}");
+        }
+        for tag in ["v1.2.3-beta", "1.2.3rc1", "1.2.3-hotfix", "1.2.3.dev1", "latest"] {
+            assert!(!is_release_version(tag), "{tag}");
+        }
+        assert_eq!(super::version_without_prefix("app/v1.3"), Some("1.3"));
+    }
+
     #[test]
     fn version_history_compares_each_version_to_the_previous_filtered_version() {
         let root = std::env::temp_dir().join(format!(
@@ -1224,7 +2266,7 @@ mod tests {
         commit_and_tag(&repo, &root, "v1.1.0-beta.1", "beta change");
         commit_and_tag(&repo, &root, "v1.1.0", "release change");
 
-        let releases = build_version_history(&repo, 2, true).unwrap();
+        let releases = build_version_history(&repo, 2, true, "en").unwrap();
         assert_eq!(releases[0].version, "v1.1.0");
         assert_eq!(releases[0].previous_version.as_deref(), Some("v1.0.0"));
         assert_eq!(
@@ -1232,12 +2274,73 @@ mod tests {
             vec!["release change", "beta change"]
         );
 
-        let all_versions = build_version_history(&repo, 2, false).unwrap();
+        let all_versions = build_version_history(&repo, 2, false, "en").unwrap();
         assert_eq!(
             all_versions[0].previous_version.as_deref(),
             Some("v1.1.0-beta.1")
         );
         assert_eq!(all_versions[0].update_note, vec!["release change"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_history_prefers_changelog_notes_in_the_language() {
+        let root = unique_temp_dir("changelog-notes");
+        let repo = Repository::init(&root).unwrap();
+        commit_and_tag(&repo, &root, "v1.0.0", "initial release");
+        commit_and_tag(&repo, &root, "v1.1.0", "commit note 1.1.0");
+        std::fs::write(
+            root.join("CHANGELOG.md"),
+            "# Changelog
+
+## v1.2.0
+- English 1.2.0
+
+## [1.1.0]
+- English 1.1.0
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("CHANGELOG.ja.md"),
+            "## v1.2.0
+- 日本語 1.2.0
+",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("CHANGELOG.md")).unwrap();
+        index.add_path(Path::new("CHANGELOG.ja.md")).unwrap();
+        index.write().unwrap();
+        commit_and_tag(&repo, &root, "v1.2.0", "commit note 1.2.0");
+
+        let japanese = build_version_history(&repo, 3, true, "ja").unwrap();
+        assert_eq!(japanese[0].update_note, vec!["日本語 1.2.0"]);
+        // v1.1.0's own tree has no changelog, so it keeps its commit messages.
+        assert_eq!(japanese[1].update_note, vec!["commit note 1.1.0"]);
+        let localized = japanese[0].localized_notes.as_ref().unwrap();
+        assert_eq!(localized["en"], vec!["English 1.2.0"]);
+        assert_eq!(localized["ko"], localized["en"]);
+        assert!(japanese[1].localized_notes.is_none());
+
+        let tags = version_tags_by_commit(&repo).unwrap();
+        let target = resolve_tag_commit(&repo, "v1.2.0").unwrap();
+        let from = resolve_tag_commit(&repo, "v1.0.0").unwrap();
+        assert_eq!(
+            update_notes(&repo, target, Some(from), "ja", &tags).unwrap(),
+            vec!["日本語 1.2.0", "English 1.1.0"]
+        );
+        assert_eq!(
+            update_notes(&repo, target, Some(from), "ko", &tags).unwrap(),
+            vec!["English 1.2.0", "English 1.1.0"]
+        );
+        // A downgrade shows the target's own entry.
+        commit_and_tag(&repo, &root, "v1.3.0", "commit note 1.3.0");
+        let newer = resolve_tag_commit(&repo, "v1.3.0").unwrap();
+        assert_eq!(
+            update_notes(&repo, target, Some(newer), "en", &tags).unwrap(),
+            vec!["English 1.2.0"]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1282,5 +2385,156 @@ mod tests {
 
         drop(source);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kept_tags_are_the_newest_releases_and_newer_prereleases() {
+        let tags = [
+            "v1.0.0",
+            "v1.1.0-beta.1",
+            "v1.1.0",
+            "v1.2.0-beta.1",
+            "v1.2.0",
+            "v1.3.0-beta.2",
+            "latest",
+        ];
+        assert_eq!(
+            super::select_kept_tags(tags, 2),
+            ["v1.3.0-beta.2", "v1.2.0", "v1.2.0-beta.1", "v1.1.0"]
+        );
+        assert_eq!(
+            super::select_kept_tags(tags, 1),
+            ["v1.3.0-beta.2", "v1.2.0"]
+        );
+        assert_eq!(super::select_kept_tags(tags, 10).len(), 6);
+    }
+
+    #[tokio::test]
+    async fn repositories_without_origin_keep_and_checkout_their_local_tags() {
+        let root = unique_temp_dir("local-only");
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        commit_and_tag(&source, &source_path, "v1.0.0", "v1.0.0");
+        commit_and_tag(&source, &source_path, "v1.1.0", "next release");
+        let repo_path = root.join("repo");
+        bare_clone(&source_path, &repo_path);
+        let repo = open_repository(&repo_path).unwrap();
+        repo.remote_delete("origin").unwrap();
+
+        super::sync_tags(&repo, "test", true, None).unwrap();
+        super::prune_tags(&repo, "test", None).unwrap();
+        assert!(repo.find_reference("refs/tags/v1.0.0").is_ok());
+        drop(repo);
+        checkout_version_tag("test", &repo_path, "v1.0.0").await.unwrap();
+        let next_commit = resolve_tag_commit(&source, "v1.1.0").unwrap().to_string();
+        assert_eq!(
+            super::get_commit_messages_for_version_diff("test", &repo_path, &next_commit[..7], "en")
+                .await
+                .unwrap(),
+            vec!["next release"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn keep_releases_fetches_only_kept_tags_and_keeps_the_checked_out_one() {
+        let root = unique_temp_dir("keep-releases");
+        let source_path = root.join("source");
+        let source = Repository::init(&source_path).unwrap();
+        for tag in ["v1.0.0", "v1.1.0", "v1.2.0-beta.1", "v1.2.0"] {
+            commit_and_tag(&source, &source_path, tag, tag);
+        }
+        let repo_path = root.join("repo");
+        bare_clone(&source_path, &repo_path);
+        let repo = open_repository(&repo_path).unwrap();
+        super::checkout_detached(
+            &repo,
+            &repo.revparse_single("refs/tags/v1.0.0").unwrap(),
+            "v1.0.0",
+        )
+        .unwrap();
+        super::set_keep_releases(&repo, Some(1)).unwrap();
+        assert_eq!(super::keep_releases(&repo), Some(1));
+
+        commit_and_tag(&source, &source_path, "v1.3.0-beta.1", "v1.3.0-beta.1");
+        super::sync_tags(&repo, "test", true, None).unwrap();
+        let mut tags: Vec<String> = repo
+            .tag_names(None)
+            .unwrap()
+            .iter()
+            .filter_map(|tag| tag.ok().flatten().map(String::from))
+            .collect();
+        tags.sort();
+        // v1.0.0 stays because it is checked out.
+        assert_eq!(tags, ["v1.0.0", "v1.2.0", "v1.3.0-beta.1"]);
+
+        super::set_keep_releases(&repo, None).unwrap();
+        assert_eq!(super::keep_releases(&repo), None);
+        super::sync_tags(&repo, "test", true, None).unwrap();
+        assert_eq!(repo.tag_names(None).unwrap().len(), 5);
+
+        drop(repo);
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Shallow fetches need a smart transport, so this clones a real update
+    /// repository: `cargo test kept_release_clone -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kept_release_clone_is_shallow_with_complete_notes() {
+        let url = std::env::var("PYAPPIFY_TEST_GIT_URL")
+            .unwrap_or_else(|_| "https://github.com/ok-oldking/ok-ww-update.git".to_string());
+        let root = unique_temp_dir("kept-clone");
+        let repo_path = root.join("repo");
+        let keep = std::env::var("PYAPPIFY_TEST_KEEP")
+            .ok()
+            .and_then(|keep| keep.parse().ok())
+            .unwrap_or(3);
+        let repo = super::clone_kept_releases(&url, &repo_path, "test", keep)
+            .unwrap()
+            .unwrap();
+        let kept: Vec<String> = super::get_sorted_tags_by_time(&repo).unwrap();
+        println!("kept tags: {kept:?}");
+        println!("shallow roots: {}", super::shallow_roots(&repo).len());
+        let mut revwalk = repo.revwalk().unwrap();
+        revwalk.push_glob("refs/tags/*").unwrap();
+        println!("commits: {}", revwalk.count());
+        assert!(super::kept_history_complete(&repo, &kept).unwrap());
+        let history = super::build_version_history(&repo, 10, false, "en").unwrap();
+        for entry in &history {
+            println!(
+                "{} <- {:?}: {:?}",
+                entry.version, entry.previous_version, entry.update_note
+            );
+        }
+        let size: u64 = walk_size(&repo_path);
+        println!("repo size: {:.1} MB", size as f64 / 1024.0 / 1024.0);
+        drop(repo);
+
+        // A later sync fetches only the kept tags into the shallow repository.
+        let repo = open_repository(&repo_path).unwrap();
+        super::sync_tags(&repo, "test", true, None).unwrap();
+        println!(
+            "size after sync: {:.1} MB",
+            walk_size(&repo_path) as f64 / 1024.0 / 1024.0
+        );
+        drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn walk_size(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk_size(&entry.path())
+                } else {
+                    meta.len()
+                }
+            })
+            .sum()
     }
 }

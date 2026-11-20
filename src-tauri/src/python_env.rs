@@ -6,7 +6,8 @@ use crate::utils::error::Error;
 use crate::utils::path::{get_python_dir, get_python_exe};
 use crate::utils::process::RemovePythonEnvsExt;
 use crate::{
-    config_manager::GLOBAL_CONFIG_STATE, emit_info, emit_update_info, err, utils::command,
+    config_manager::GLOBAL_CONFIG_STATE, emit_error, emit_info, emit_update_info, err,
+    pip_mirror, utils::command,
 };
 use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
@@ -15,8 +16,11 @@ use rand::RngExt;
 use reqwest::Client;
 use reqwest::Url;
 use std::io::Write;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use rust_i18n::t;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::{fs, io};
 use tar::Archive;
 use tracing::{error, info, warn};
@@ -87,44 +91,30 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
                         python_exe_path.display()
                     );
                     return Ok((python_exe_path, installed_version));
-                } else {
-                    info!(
-                        "Found incompatible Python version {} (required {}). Removing and reinstalling.",
-                        installed_version, major_minor_from_param
-                    );
-                    fs::remove_dir_all(&install_dir).with_context(|| {
-                        format!(
-                            "Failed to remove existing Python installation at {}",
-                            install_dir.display()
-                        )
-                    })?;
-                    fs::create_dir_all(&install_dir).with_context(|| {
-                        format!(
-                            "Failed to recreate Python installation directory at {}",
-                            install_dir.display()
-                        )
-                    })?;
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Existing python.exe at {} is corrupted or unusable ({}). Removing and reinstalling.",
-                    python_exe_path.display(), e
+                info!(
+                    "Found incompatible Python version {} (required {}). Removing and reinstalling.",
+                    installed_version, major_minor_from_param
                 );
-                fs::remove_dir_all(&install_dir).with_context(|| {
-                    format!(
-                        "Failed to remove corrupted Python installation at {}",
-                        install_dir.display()
-                    )
-                })?;
-                fs::create_dir_all(&install_dir).with_context(|| {
-                    format!(
-                        "Failed to recreate Python installation directory at {}",
-                        install_dir.display()
-                    )
-                })?;
             }
+            Err(e) => warn!(
+                "Existing python.exe at {} is corrupted or unusable ({}). Removing and reinstalling.",
+                python_exe_path.display(),
+                e
+            ),
         }
+        fs::remove_dir_all(&install_dir).with_context(|| {
+            format!(
+                "Failed to remove existing Python installation at {}",
+                install_dir.display()
+            )
+        })?;
+        fs::create_dir_all(&install_dir).with_context(|| {
+            format!(
+                "Failed to recreate Python installation directory at {}",
+                install_dir.display()
+            )
+        })?;
     }
 
     let version_to_ensure = get_latest_known_patch_for_major_minor(&major_minor_from_param)?;
@@ -149,31 +139,16 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
                 "Download from primary URL {} failed: {:#}. Trying backup URL: {}",
                 primary_url, e, backup_url
             );
-            if archive_path.exists() {
-                fs::remove_file(&archive_path).ok();
-            }
+            remove_path_logged(&archive_path);
             download_file(&backup_url, &archive_path, app_name).await
         }
     };
-
     if let Err(download_err) = download_result {
         error!(
             "Download failed from both primary and backup URLs: {:#}",
             download_err
         );
-        if archive_path.exists() {
-            info!(
-                "Attempting to remove partially downloaded file: {}",
-                archive_path.display()
-            );
-            if let Err(remove_file_err) = fs::remove_file(&archive_path) {
-                warn!(
-                    "Failed to remove partially downloaded file {}: {}",
-                    archive_path.display(),
-                    remove_file_err
-                );
-            }
-        }
+        remove_path_logged(&archive_path);
         return Err(download_err.context(format!(
             "Downloading Python {} from all available sources failed",
             version_to_ensure
@@ -183,35 +158,6 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
         "Successfully downloaded archive to {}",
         archive_path.display()
     );
-
-    info!(
-        "Creating installation directory {}...",
-        install_dir.display()
-    );
-    if let Err(create_dir_err) = fs::create_dir_all(&install_dir) {
-        error!(
-            "Failed to create target install directory {}: {}",
-            install_dir.display(),
-            create_dir_err
-        );
-        if archive_path.exists() {
-            info!(
-                "Attempting to remove downloaded archive {} as installation cannot proceed.",
-                archive_path.display()
-            );
-            if let Err(remove_file_err) = fs::remove_file(&archive_path) {
-                warn!(
-                    "Failed to remove archive file {} after directory creation failure: {}",
-                    archive_path.display(),
-                    remove_file_err
-                );
-            }
-        }
-        return Err(anyhow!(create_dir_err).context(format!(
-            "Creating install directory {} failed",
-            install_dir.display()
-        )));
-    }
 
     info!(
         "Extracting archive {} to {}...",
@@ -224,6 +170,8 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
         cancellation::ensure_app_operation_not_cancelled()?;
         Ok(())
     })();
+    // The archive is only needed for extraction, whatever the outcome.
+    remove_path_logged(&archive_path);
     if let Err(extract_err) = extract_result {
         error!(
             "Extraction from {} to {} failed: {:#}",
@@ -231,25 +179,7 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
             install_dir.display(),
             extract_err
         );
-        info!("Attempting to clean up downloaded file and extraction folder.");
-        if archive_path.exists() {
-            if let Err(remove_file_err) = fs::remove_file(&archive_path) {
-                warn!(
-                    "Failed to remove archive file {}: {}",
-                    archive_path.display(),
-                    remove_file_err
-                );
-            }
-        }
-        if install_dir.exists() {
-            if let Err(remove_dir_err) = fs::remove_dir_all(&install_dir) {
-                warn!(
-                    "Failed to remove extraction directory {}: {}",
-                    install_dir.display(),
-                    remove_dir_err
-                );
-            }
-        }
+        remove_path_logged(&install_dir);
         return Err(extract_err.context(format!(
             "Extracting archive {} to {} failed",
             archive_path.display(),
@@ -262,29 +192,9 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
         install_dir.display()
     );
 
-    info!(
-        "Removing archive file {} after successful extraction...",
-        archive_path.display()
-    );
-    if let Err(remove_file_err) = fs::remove_file(&archive_path) {
-        warn!("Failed to remove archive file {} after successful extraction: {}. This is non-critical.", archive_path.display(), remove_file_err);
-    }
-
     if !python_exe_path.exists() {
         error!("CRITICAL: python.exe not found at {} after extraction reported success. Installation is incomplete.", python_exe_path.display());
-        if install_dir.exists() {
-            info!(
-                "Attempting to remove incomplete installation directory: {}",
-                install_dir.display()
-            );
-            if let Err(remove_dir_err) = fs::remove_dir_all(&install_dir) {
-                warn!(
-                    "Failed to remove incomplete installation directory {}: {}",
-                    install_dir.display(),
-                    remove_dir_err
-                );
-            }
-        }
+        remove_path_logged(&install_dir);
         return Err(anyhow!(
             "python.exe not found at {} after extraction, though extraction reported success. The installation is likely corrupt.",
             python_exe_path.display()
@@ -292,6 +202,22 @@ async fn ensure_python_version(app_name: &str, version_str: &str) -> Result<(Pat
     }
 
     Ok((python_exe_path, version_to_ensure))
+}
+
+/// Best-effort removal of a file or directory; failures are only logged.
+#[cfg(target_os = "windows")]
+fn remove_path_logged(path: &Path) {
+    let result = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else if path.exists() {
+        fs::remove_file(path)
+    } else {
+        return;
+    };
+    match result {
+        Ok(()) => info!("Removed {}", path.display()),
+        Err(e) => warn!("Failed to remove {}: {}", path.display(), e),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -306,10 +232,22 @@ fn extract_archive(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
             )
         })?;
 
+    let open_archive = || {
+        fs::File::open(archive_path)
+            .with_context(|| format!("Failed to open archive: {}", archive_path.display()))
+    };
+
     if file_name.ends_with(".zip") {
         extract_zip(archive_path, extract_to_dir)
     } else if file_name.ends_with(".tar.gz") {
-        extract_tar_gz(archive_path, extract_to_dir)
+        // python-build-standalone "install_only" archives keep the install under python/.
+        extract_tar(GzDecoder::new(open_archive()?), "python", extract_to_dir)
+    } else if file_name.ends_with(".tar.zst") {
+        // Older python-build-standalone "full" archives keep the install under
+        // python/install/, next to build artifacts that must not be extracted.
+        let decoder = zstd::stream::read::Decoder::new(open_archive()?)
+            .context("Failed to initialize zstd decoder")?;
+        extract_tar(decoder, "python/install", extract_to_dir)
     } else {
         Err(anyhow!("Unsupported archive format: {}", file_name))
     }
@@ -332,22 +270,17 @@ fn extract_zip(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn extract_tar_gz(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
-    let tar_gz_file = fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open tar.gz archive: {}", archive_path.display()))?;
-    let tar_stream = GzDecoder::new(tar_gz_file);
-    let mut archive = Archive::new(tar_stream);
+fn extract_tar<R: io::Read>(reader: R, strip_prefix: &str, extract_to_dir: &Path) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    let mut skipped_entries = 0usize;
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result.context("Failed to read entry from tar archive")?;
         let path_in_archive = entry.path()?.into_owned();
-        let path_after_stripping_python_dir = match path_in_archive.strip_prefix("python") {
+        let path_after_stripping_python_dir = match path_in_archive.strip_prefix(strip_prefix) {
             Ok(p) => p.to_path_buf(),
             Err(_) => {
-                warn!(
-                    "Archive entry {} not under expected 'python/' top-level directory. Skipping.",
-                    path_in_archive.display()
-                );
+                skipped_entries += 1;
                 continue;
             }
         };
@@ -384,6 +317,12 @@ fn extract_tar_gz(archive_path: &Path, extract_to_dir: &Path) -> Result<()> {
                 )
             })?;
         }
+    }
+    if skipped_entries > 0 {
+        info!(
+            "Skipped {} archive entries outside '{}/'.",
+            skipped_entries, strip_prefix
+        );
     }
     Ok(())
 }
@@ -491,8 +430,8 @@ async fn download_file(url: &str, dest_path: &Path, app_name: &str) -> Result<()
             .with_context(|| format!("Failed to write chunk to file {}", dest_path.display()))?;
         downloaded += chunk.len() as u64;
 
-        if total_size > 0 {
-            let percent = (100 * downloaded / total_size) as i64;
+        if let Some(percent) = (100 * downloaded).checked_div(total_size) {
+            let percent = percent as i64;
             if percent > last_reported_percent {
                 emit_update_info!(app_name, "Python Download Progress: {}%", percent);
                 last_reported_percent = percent;
@@ -523,7 +462,7 @@ pub async fn setup_python_env(app_name: String, python_version_spec: &str) -> Re
     Ok(managed_python_exe)
 }
 #[cfg(not(target_os = "windows"))]
-pub fn setup_python_env(_app_name: String, _python_version_spec: &str) -> Result<PathBuf> {
+pub async fn setup_python_env(_app_name: String, _python_version_spec: &str) -> Result<PathBuf> {
     Err(anyhow!("setup_python_env is only implemented for Windows."))
 }
 #[cfg(target_os = "windows")]
@@ -535,13 +474,16 @@ pub async fn install_requirements(
 ) -> Result<(), Error> {
     let python_exe = get_python_exe(app_name, false);
     if !python_exe.exists() {
-        err!("Python executable not found at {}", python_exe.display());
+        return Err(err!(
+            "Python executable not found at {}",
+            python_exe.display()
+        ));
     }
     if !project_dir.is_dir() {
-        err!(
+        return Err(err!(
             "Project directory for pip execution not found or not a directory: {}",
             project_dir.display()
-        );
+        ));
     }
     let config_state = GLOBAL_CONFIG_STATE.get().ok_or_else(|| {
         anyhow!("GLOBAL_CONFIG_STATE not initialized. Call init_config_manager first.")
@@ -562,46 +504,57 @@ pub async fn install_requirements(
     } else {
         format!("{} -m pip install {}", python_exe.display(), requirements)
     };
-    let mut pip_install_cmd = new_cmd(python_exe);
-    pip_install_cmd
-        .current_dir(project_dir)
-        .arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg("--no-warn-script-location");
-    pip_install_cmd.clear_python_envs();
-    let mut use_config_index_url = true;
-    if !pip_args.is_empty() {
-        if pip_args
-            .split_whitespace()
-            .any(|arg| arg == "--index-url" || arg == "-i")
-        {
-            use_config_index_url = false;
-        }
-        pip_install_cmd.args(pip_args.split_whitespace());
-    }
-    if requirements.ends_with(".txt") {
+    let requirements_path = if requirements.ends_with(".txt") {
         let requirements_path = project_dir.join(requirements);
         if !requirements_path.exists() {
-            err!(
+            return Err(err!(
                 "Requirements file not found at {}",
                 requirements_path.display()
-            );
+            ));
         }
-        pip_install_cmd.arg("-r").arg(&requirements_path);
+        Some(requirements_path)
     } else {
-        pip_install_cmd.arg(requirements);
+        None
+    };
+    let explicit_index = pip_args.split_whitespace().any(|arg| {
+        arg == "--index-url"
+            || arg == "-i"
+            || arg.starts_with("--index-url=")
+            || (arg.starts_with("-i") && !arg.starts_with("--"))
+    });
+    let mut index_url = if explicit_index { None } else { pip_index_url };
+    let mut automatic = false;
+    if !explicit_index && index_url.is_none() && !pip_mirror::pip_has_index_config(&python_exe).await {
+        index_url = pip_mirror::auto_url(app_name).await;
+        automatic = index_url.is_some();
     }
-    if let Some(cache_dir) = pip_cache_dir {
-        pip_install_cmd.arg("--cache-dir").arg(cache_dir);
+    if !explicit_index {
+        emit_info!(app_name, "set --index-url {:?}", index_url);
     }
-    if use_config_index_url {
-        emit_info!(app_name, "set --index-url {:?}", pip_index_url);
-        if let Some(index_url) = pip_index_url {
+    let build_pip_install_cmd = |index_url: Option<&str>| {
+        let mut pip_install_cmd = new_cmd(&python_exe);
+        pip_install_cmd
+            .current_dir(project_dir)
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("--no-warn-script-location");
+        pip_install_cmd.clear_python_envs();
+        pip_install_cmd.args(pip_args.split_whitespace());
+        match &requirements_path {
+            Some(requirements_path) => pip_install_cmd.arg("-r").arg(requirements_path),
+            None => pip_install_cmd.arg(requirements),
+        };
+        if let Some(cache_dir) = &pip_cache_dir {
+            pip_install_cmd.arg("--cache-dir").arg(cache_dir);
+        }
+        if let Some(index_url) = index_url {
             pip_install_cmd.arg("--index-url").arg(index_url);
         }
-    }
+        pip_install_cmd
+    };
 
+    cancellation::ensure_app_operation_not_cancelled()?;
     let marker_path = project_dir.join(PIP_UPDATE_NEEDED_MARKER);
     fs::File::create(&marker_path).with_context(|| {
         format!(
@@ -610,14 +563,27 @@ pub async fn install_requirements(
         )
     })?;
 
-    if let Some(token) = cancellation::current_token(app_name) {
-        command::run_command_cancellable(pip_install_cmd, app_name, &pip_install_desc, token)
-            .await?;
-        cancellation::begin_commit()?;
-    } else {
-        command::run_command_and_stream_output(pip_install_cmd, app_name, &pip_install_desc)
-            .await?;
+    let mut result = run_pip_install(
+        build_pip_install_cmd(index_url.as_deref()),
+        app_name,
+        &pip_install_desc,
+        index_url.as_deref(),
+    )
+    .await;
+    if automatic
+        && !cancellation::app_operation_cancelled()
+        && result.as_ref().is_err_and(|error| !cancellation::is_cancelled(error))
+    {
+        emit_info!(
+            app_name,
+            "pip install with {} failed; retrying with pip's default index",
+            index_url.as_deref().unwrap_or_default()
+        );
+        pip_mirror::forget_auto_url();
+        result = run_pip_install(build_pip_install_cmd(None), app_name, &pip_install_desc, None).await;
     }
+    result?;
+    cancellation::begin_commit()?;
 
     if marker_path.try_exists()? {
         fs::remove_file(&marker_path).with_context(|| {
@@ -637,6 +603,42 @@ pub async fn install_requirements(
     Ok(())
 }
 
+/// Run pip; a failure caused by an unreachable index becomes a translated
+/// hint to check the network or switch the pip mirror.
+#[cfg(target_os = "windows")]
+async fn run_pip_install(
+    pip_install_cmd: tokio::process::Command,
+    app_name: &str,
+    pip_install_desc: &str,
+    index_url: Option<&str>,
+) -> Result<(), Error> {
+    let output = Arc::new(Mutex::new(String::new()));
+    match command::run_command_and_capture_output(
+        pip_install_cmd,
+        app_name,
+        pip_install_desc,
+        output.clone(),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if cancellation::is_cancelled(&error) => Err(error),
+        Err(error) => {
+            let pip_output = output.lock().unwrap().clone();
+            if !pip_mirror::is_network_error(&pip_output) {
+                return Err(error);
+            }
+            let message = t!(
+                "message.pip_network_error",
+                index = index_url.unwrap_or("pip default")
+            )
+            .to_string();
+            emit_error!(app_name, "{}", message);
+            Err(Error::Msg(message))
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 pub async fn install_requirements(
     _app_name: &str,
@@ -644,7 +646,7 @@ pub async fn install_requirements(
     _project_dir: &Path,
     _pip_args: &str,
 ) -> Result<(), Error> {
-    err!("install_requirements is only implemented for Windows.")
+    Err(err!("install_requirements is only implemented for Windows."))
 }
 
 #[cfg(target_os = "windows")]

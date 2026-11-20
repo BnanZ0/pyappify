@@ -99,6 +99,10 @@ pub struct App {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub show_add_defender: bool,
+    /// How many of the newest release versions the app's repository keeps
+    /// (with the prereleases newer than the oldest of them). `None` keeps all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_releases: Option<usize>,
 }
 
 fn default_last_start_fn() -> DateTime<Utc> {
@@ -392,6 +396,7 @@ pub fn update_app_from_yml(app: &mut App, file_path_str: &str) {
         app.mirrorchyan = parsed_app.mirrorchyan;
     }
     app.profiles = parsed_app.profiles;
+    app.keep_releases = parsed_app.keep_releases;
 
     if app.get_profile(&app.current_profile).is_none() {
         if let Some(first_profile) = app.profiles.first() {
